@@ -4,7 +4,9 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { applyUiMetadata, collectUiMetadata } from "./ui-metadata.mjs";
 
@@ -102,6 +104,7 @@ async function loadConfig() {
   config.sync ??= {};
   config.sync.lockStaleMinutes ??= 30;
   config.sync.settleMilliseconds ??= 1500;
+  config.sync.stripEncryptedContent ??= true;
   dataRepoRoot = config.git.dataRepository;
   stateDir = path.join(dataRepoRoot, ".sync");
   lockPath = path.join(stateDir, "sync.lock");
@@ -223,6 +226,64 @@ function normalizeProviderInFirstLine(line) {
     return JSON.stringify(value);
   } catch {
     return line;
+  }
+}
+
+function removeEncryptedContent(value) {
+  if (Array.isArray(value)) return value.map(removeEncryptedContent);
+  if (!value || typeof value !== "object") return value;
+  for (const key of Object.keys(value)) {
+    if (key === "encrypted_content") delete value[key];
+    else value[key] = removeEncryptedContent(value[key]);
+  }
+  return value;
+}
+
+function normalizePortableLine(line, { firstLine = false, targetProvider = null, stripEncryptedContent = true } = {}) {
+  const needsProviderRewrite = firstLine && targetProvider !== null;
+  const needsEncryptedContentStrip = stripEncryptedContent && line.includes('"encrypted_content"');
+  if (!needsProviderRewrite && !needsEncryptedContentStrip) return line;
+  try {
+    const value = JSON.parse(line);
+    const payload = value?.payload ?? value;
+    if (needsProviderRewrite && payload && Object.prototype.hasOwnProperty.call(payload, "model_provider")) {
+      payload.model_provider = targetProvider;
+    }
+    if (needsEncryptedContentStrip) removeEncryptedContent(value);
+    return JSON.stringify(value);
+  } catch {
+    return line;
+  }
+}
+
+async function transformedLines(filePath, options = {}) {
+  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let firstLine = true;
+  return {
+    async *[Symbol.asyncIterator]() {
+      try {
+        for await (const line of lines) {
+          yield normalizePortableLine(line, { ...options, firstLine });
+          firstLine = false;
+        }
+      } finally {
+        lines.close();
+        stream.destroy();
+      }
+    }
+  };
+}
+
+async function fileContainsEncryptedContent(filePath) {
+  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) if (line.includes('"encrypted_content"')) return true;
+    return false;
+  } finally {
+    lines.close();
+    stream.destroy();
   }
 }
 
@@ -348,36 +409,24 @@ function normalizedFirstLineBuffer(buffer) {
   return { normalized, tail };
 }
 
-async function canonicalDigest(filePath) {
+async function canonicalDigest(filePath, stripEncryptedContent = true) {
   const hash = crypto.createHash("sha256");
-  const stream = fs.createReadStream(filePath);
-  let first = true;
-  let pending = Buffer.alloc(0);
-  for await (const chunk of stream) {
-    if (!first) {
-      hash.update(chunk);
-      continue;
-    }
-    pending = Buffer.concat([pending, chunk]);
-    const newline = pending.indexOf(0x0a);
-    if (newline < 0) continue;
-    const line = pending.subarray(0, newline).toString("utf8").replace(/\r$/, "");
-    hash.update(normalizeProviderInFirstLine(line));
+  for await (const line of await transformedLines(filePath, { targetProvider: "__SYNC_PROVIDER__", stripEncryptedContent })) {
+    hash.update(line);
     hash.update("\n");
-    hash.update(pending.subarray(newline + 1));
-    first = false;
   }
-  if (first) hash.update(normalizeProviderInFirstLine(pending.toString("utf8")));
   return hash.digest("hex");
 }
 
-async function providerAgnosticPrefix(longerPath, shorterPath) {
-  const longer = await fsp.readFile(longerPath);
-  const shorter = await fsp.readFile(shorterPath);
-  const a = normalizedFirstLineBuffer(longer);
-  const b = normalizedFirstLineBuffer(shorter);
-  if (!a.normalized.equals(b.normalized)) return false;
-  return b.tail.length <= a.tail.length && a.tail.subarray(0, b.tail.length).equals(b.tail);
+async function providerAgnosticPrefix(longerPath, shorterPath, stripEncryptedContent = true) {
+  const longer = (await transformedLines(longerPath, { targetProvider: "__SYNC_PROVIDER__", stripEncryptedContent }))[Symbol.asyncIterator]();
+  const shorter = (await transformedLines(shorterPath, { targetProvider: "__SYNC_PROVIDER__", stripEncryptedContent }))[Symbol.asyncIterator]();
+  for (;;) {
+    const shortLine = await shorter.next();
+    if (shortLine.done) return true;
+    const longLine = await longer.next();
+    if (longLine.done || longLine.value !== shortLine.value) return false;
+  }
 }
 
 async function copyAtomic(source, destination) {
@@ -390,25 +439,31 @@ async function copyAtomic(source, destination) {
   });
 }
 
-async function copySessionForProvider(source, destination, targetProvider) {
-  const sourceBytes = await fsp.readFile(source);
-  const newline = sourceBytes.indexOf(0x0a);
-  const firstLine = sourceBytes.subarray(0, newline >= 0 ? newline : sourceBytes.length).toString("utf8").replace(/\r$/, "");
-  const rewritten = Buffer.from(rewriteProviderInFirstLine(firstLine, targetProvider), "utf8");
-  const separator = newline >= 0 ? Buffer.from("\n") : Buffer.alloc(0);
-  const tail = newline >= 0 ? sourceBytes.subarray(newline + 1) : Buffer.alloc(0);
+async function copySessionForProvider(source, destination, targetProvider, stripEncryptedContent = true) {
   await fsp.mkdir(path.dirname(destination), { recursive: true });
   const temp = `${destination}.tmp-${process.pid}-${Date.now()}`;
-  await fsp.writeFile(temp, Buffer.concat([rewritten, separator, tail]));
-  await fsp.rename(temp, destination).catch(async () => {
-    await fsp.rm(destination, { force: true });
-    await fsp.rename(temp, destination);
-  });
+  const output = fs.createWriteStream(temp, { encoding: "utf8", flags: "wx" });
+  try {
+    for await (const line of await transformedLines(source, { targetProvider, stripEncryptedContent })) {
+      if (!output.write(`${line}\n`)) await once(output, "drain");
+    }
+    output.end();
+    await once(output, "finish");
+    await fsp.rename(temp, destination).catch(async () => {
+      await fsp.rm(destination, { force: true });
+      await fsp.rename(temp, destination);
+    });
+  } catch (error) {
+    output.destroy();
+    await fsp.rm(temp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
-async function destinationMatches(destination, expectedDigest, targetProvider) {
+async function destinationMatches(destination, expectedDigest, targetProvider, stripEncryptedContent = true) {
   if (!(await exists(destination))) return false;
-  if (await canonicalDigest(destination) !== expectedDigest) return false;
+  if (stripEncryptedContent && await fileContainsEncryptedContent(destination)) return false;
+  if (await canonicalDigest(destination, stripEncryptedContent) !== expectedDigest) return false;
   return providerFromFirstLine(await readFirstLine(destination)) === targetProvider;
 }
 
@@ -755,9 +810,9 @@ async function collectLockedThreadIds(config) {
   return locked;
 }
 
-async function selectWinner(id, candidates) {
+async function selectWinner(id, candidates, stripEncryptedContent = true) {
   const enriched = [];
-  for (const candidate of candidates) enriched.push({ ...candidate, digest: await canonicalDigest(candidate.filePath) });
+  for (const candidate of candidates) enriched.push({ ...candidate, digest: await canonicalDigest(candidate.filePath, stripEncryptedContent) });
   const digestGroups = new Map();
   for (const candidate of enriched) {
     const list = digestGroups.get(candidate.digest) ?? [];
@@ -768,16 +823,21 @@ async function selectWinner(id, candidates) {
     return enriched.sort((a, b) => Number(b.canonical) - Number(a.canonical) || b.stat.mtimeMs - a.stat.mtimeMs || b.stat.size - a.stat.size)[0];
   }
 
-  const ordered = enriched.sort((a, b) => b.stat.size - a.stat.size || b.stat.mtimeMs - a.stat.mtimeMs);
-  const largest = ordered[0];
-  let largestContainsAll = true;
-  for (const candidate of ordered.slice(1)) {
-    if (!(await providerAgnosticPrefix(largest.filePath, candidate.filePath))) {
-      largestContainsAll = false;
-      break;
+  // Raw file size is not a safe ordering when portable copies omit
+  // provider-bound encrypted_content. Find the candidate whose normalized
+  // history contains every other candidate instead.
+  const ordered = enriched.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs || b.stat.size - a.stat.size);
+  for (const possibleWinner of ordered) {
+    let containsAll = true;
+    for (const candidate of ordered) {
+      if (candidate === possibleWinner) continue;
+      if (!(await providerAgnosticPrefix(possibleWinner.filePath, candidate.filePath, stripEncryptedContent))) {
+        containsAll = false;
+        break;
+      }
     }
+    if (containsAll) return possibleWinner;
   }
-  if (largestContainsAll) return largest;
 
   await fsp.mkdir(path.join(conflictRoot, id), { recursive: true });
   for (const candidate of enriched) {
@@ -834,7 +894,7 @@ async function synchronizeFiles(config) {
       await log(`defer active session ${id}`);
       continue;
     }
-    const winner = await selectWinner(id, candidates);
+    const winner = await selectWinner(id, candidates, config.sync.stripEncryptedContent);
     if (!winner) {
       conflicts += 1;
       continue;
@@ -850,14 +910,15 @@ async function synchronizeFiles(config) {
         canonicalPath = `${canonicalPath.slice(0, -extension.length)}-${id}${extension}`;
       }
     }
-    if (!(await exists(canonicalPath)) || await canonicalDigest(canonicalPath) !== winner.digest) {
+    const winnerCanonicalDigest = await canonicalDigest(winner.filePath, false);
+    if (!(await exists(canonicalPath)) || await canonicalDigest(canonicalPath, false) !== winnerCanonicalDigest) {
       await copyAtomic(winner.filePath, canonicalPath);
       copiedToCanonical += 1;
     }
     for (const candidate of candidates.filter((entry) => entry.sourceName === "git" && entry.bucket === desiredBucket)) {
       for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
         if (path.resolve(filePath) === path.resolve(canonicalPath)) continue;
-        if (await canonicalDigest(filePath) === await canonicalDigest(canonicalPath)) await fsp.rm(filePath, { force: true });
+        if (await canonicalDigest(filePath, config.sync.stripEncryptedContent) === await canonicalDigest(canonicalPath, config.sync.stripEncryptedContent)) await fsp.rm(filePath, { force: true });
       }
     }
     archiveMoves += await moveOppositeCopies(candidates, "git", path.join(dataRepoRoot, "data"), desiredBucket, canonicalPath);
@@ -873,14 +934,16 @@ async function synchronizeFiles(config) {
         }
       }
       const targetProvider = homeProviders.get(home.name);
-      if (!(await destinationMatches(destination, winner.digest, targetProvider))) {
-        await copySessionForProvider(canonicalPath, destination, targetProvider);
+      const stripForTarget = config.sync.stripEncryptedContent && winner.meta.provider !== targetProvider;
+      const expectedDestinationDigest = await canonicalDigest(canonicalPath, stripForTarget);
+      if (!(await destinationMatches(destination, expectedDestinationDigest, targetProvider, stripForTarget))) {
+        await copySessionForProvider(canonicalPath, destination, targetProvider, stripForTarget);
         copiedToHomes += 1;
       }
       for (const candidate of candidates.filter((entry) => entry.sourceName === home.name && entry.bucket === desiredBucket)) {
         for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
           if (path.resolve(filePath) === path.resolve(destination)) continue;
-          if (await canonicalDigest(filePath) === await canonicalDigest(destination)) await fsp.rm(filePath, { force: true });
+          if (await canonicalDigest(filePath, config.sync.stripEncryptedContent) === await canonicalDigest(destination, config.sync.stripEncryptedContent)) await fsp.rm(filePath, { force: true });
         }
       }
       archiveMoves += await moveOppositeCopies(candidates, home.name, home.path, desiredBucket, destination);

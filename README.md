@@ -176,6 +176,7 @@ codex-history-sync doctor
 | `refreshThreadIndex` | `true` | 导入后调用每个 Home 的 Codex `thread/list` 补建线程索引 |
 | `indexRefreshTimeoutSeconds` | `120` | 每个 Home 的索引刷新超时 |
 | `includeUiMetadata` | `true` | 同步名称、Project 定义和线程的 Project 归属 |
+| `stripEncryptedContent` | `true` | 从跨 Home/Provider 的可移植副本中移除账号或 Provider 绑定的 `encrypted_content`，保留可见消息、工具记录和推理摘要；避免切换账号或 Provider 后继续会话时报 `invalid_encrypted_content` |
 | `settleMilliseconds` | `1500` | 扫描前等待文件写入稳定 |
 | `lockStaleMinutes` | `30` | 同步锁过期时间 |
 
