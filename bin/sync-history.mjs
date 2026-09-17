@@ -747,6 +747,14 @@ async function collectActiveThreadIds(config) {
   return active;
 }
 
+async function collectLockedThreadIds(config) {
+  const locked = new Set();
+  for (const home of config.homes) {
+    for (const id of await activeThreadIds(home.path)) locked.add(id);
+  }
+  return locked;
+}
+
 async function selectWinner(id, candidates) {
   const enriched = [];
   for (const candidate of candidates) enriched.push({ ...candidate, digest: await canonicalDigest(candidate.filePath) });
@@ -813,6 +821,7 @@ async function synchronizeFiles(config) {
     ? { archivedById: new Map(), observations: new Map(), changedIds: new Set(), needsApplyIds: new Set(), eventsWritten: 0, disabled: true }
     : await resolveArchiveStates(config, grouped);
   const active = await collectActiveThreadIds(config);
+  const locked = await collectLockedThreadIds(config);
   const homeProviders = new Map();
   for (const home of config.homes) homeProviders.set(home.name, await readConfiguredProvider(home.path));
   let copiedToCanonical = 0;
@@ -820,7 +829,8 @@ async function synchronizeFiles(config) {
   let conflicts = 0;
   let archiveMoves = 0;
   for (const [id, candidates] of grouped) {
-    if (active.has(id) && !archiveState.changedIds.has(id)) {
+    const archiveTransition = archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id);
+    if (active.has(id) && (!archiveTransition || locked.has(id))) {
       await log(`defer active session ${id}`);
       continue;
     }
