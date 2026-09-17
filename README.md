@@ -233,4 +233,9 @@ conflicts/<session-id>/
 
 ## 上游组件
 
-`vendor/codex-provider-sync` 固定自上游版本，只负责 Provider 元数据转换和同步。
+`vendor/codex-provider-sync` 来自开源项目
+[Dailin521/codex-provider-sync](https://github.com/Dailin521/codex-provider-sync)，当前固定为
+`v1.0.3`，依据 MIT License 使用，只负责 Provider 元数据转换和同步。
+
+上游许可证原文保留在 `vendor/codex-provider-sync/LICENSE`，完整第三方归属说明见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
