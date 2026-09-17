@@ -15,6 +15,7 @@ Provider 刷新。聊天记录保存在用户指定的独立私有数据仓库�
 - 使用 Git LFS 保存大型 rollout JSONL。
 - `SessionStart` 自动 pull、导入和刷新 Provider。
 - `SessionEnd` 在后台防抖后 commit/push。
+- 可选在自定义客户端完全退出后再次落盘 UI 项目元数据，避免桌面宿主退出时用旧缓存覆盖同步结果。
 - 根据每个 Home 自己的 `config.toml` 保留不同 `model_provider`。
 - 活跃或最近仍在写入的会话延迟处理。
 - 真正分叉的同一 session 保存到 `conflicts/<session-id>/`，不静默覆盖。
@@ -106,6 +107,8 @@ node .\bin\cli.mjs sync
 codex-history-sync init --home NAME=PATH [--home NAME=PATH ...] [--remote URL]
 codex-history-sync install-hooks [--logon-task]
 codex-history-sync sync [--no-pull] [--no-push] [--no-commit]
+codex-history-sync finalize-ui [HOME_NAME]
+codex-history-sync watch-exit HOME_NAME
 codex-history-sync enqueue
 codex-history-sync doctor
 ```
@@ -123,6 +126,8 @@ codex-history-sync doctor
 | `name` | 唯一名称，仅用于日志和诊断 |
 | `path` | 绝对路径、相对仓库路径或 `~` 路径 |
 | `installHooks` | 是否向该 Home 安装 `hooks.json`，默认 `true`；关闭后该 Home 仍参与读写同步 |
+| `finalizeUiOnExit` | 可选；为 `true` 时，`SessionEnd` 会启动退出监听器，在该客户端进程完全结束后重写 UI 项目状态 |
+| `uiStateExitProcessPaths` | 可选；需要等待退出的客户端/后端可执行文件路径列表；全部退出后才执行最终化 |
 
 不限制 Home 数量。
 
@@ -170,6 +175,8 @@ SessionEnd
   → 3 秒内启动后台任务
   → 防抖
   → 执行同样的同步流程
+  → 对启用 finalizeUiOnExit 的 Home 等待客户端完全退出
+  → 写入 .codex-global-state.json 及其 .bak，使下次启动载入完整项目列表
 ```
 
 Codex 用户级 Hook 在变更后需要通过 `/hooks` 重新信任。官方说明见

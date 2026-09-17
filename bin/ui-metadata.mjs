@@ -417,3 +417,78 @@ export async function applyUiMetadata(config, home, metadata) {
     stateUpdated: stateNeedsUpdate
   };
 }
+
+export async function writeUiMetadataState(config, home, metadata, { writeBackupState = false } = {}) {
+  if (config.sync.includeUiMetadata === false) return { skipped: true, reason: "disabled" };
+
+  const globalStatePath = path.join(home.path, ".codex-global-state.json");
+  let state = {};
+  try { state = JSON.parse(await fsp.readFile(globalStatePath, "utf8")); } catch {}
+
+  const localProjects = { ...(state["local-projects"] ?? {}) };
+  const assignments = { ...(state["thread-project-assignments"] ?? {}) };
+  const projectOrder = [...(state["project-order"] ?? [])];
+  const hostKey = `local:${home.path.replaceAll("/", "\\")}`;
+  const projectMappings = { ...(state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {}) };
+  const dbPath = stateDbPath(home.path);
+  const projectsByRoots = new Map();
+
+  if (dbPath) {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const rootsByProject = new Map();
+      for (const row of db.prepare("SELECT project_id, path FROM project_roots ORDER BY project_id, position").all()) {
+        const roots = rootsByProject.get(row.project_id) ?? [];
+        roots.push(row.path);
+        rootsByProject.set(row.project_id, roots);
+      }
+      for (const row of db.prepare("SELECT id FROM projects").all()) {
+        projectsByRoots.set(rootsKey(rootsByProject.get(row.id) ?? []), row.id);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  for (const project of metadata.projects ?? []) {
+    localProjects[project.id] = {
+      id: project.id,
+      name: project.name,
+      rootPaths: project.roots ?? [],
+      createdAt: project.createdAt ?? Date.now(),
+      updatedAt: project.updatedAt ?? Date.now()
+    };
+    if (!projectOrder.includes(project.id)) projectOrder.push(project.id);
+    for (const threadId of project.threadIds ?? []) assignments[threadId] = { projectKind: "local", projectId: project.id };
+    const appProjectId = projectsByRoots.get(rootsKey(project.roots ?? []));
+    if (appProjectId) projectMappings[project.id] = appProjectId;
+  }
+
+  state["local-projects"] = localProjects;
+  state["thread-project-assignments"] = assignments;
+  state["project-order"] = projectOrder.filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
+  state["projectless-thread-ids"] = (state["projectless-thread-ids"] ?? []).filter((threadId) => !assignments[threadId]);
+  state["app-server-project-id-by-legacy-project-id-by-host"] = {
+    ...(state["app-server-project-id-by-legacy-project-id-by-host"] ?? {}),
+    [hostKey]: projectMappings
+  };
+  state["app-server-projects-migration-by-host"] = {
+    ...(state["app-server-projects-migration-by-host"] ?? {}),
+    [hostKey]: { version: 1, projectsMigrated: true, threadAssignmentsMigrated: true, pendingThreadAssignmentIds: [] }
+  };
+
+  await fsp.mkdir(home.path, { recursive: true });
+  const text = `${JSON.stringify(state)}\n`;
+  const temporaryPath = `${globalStatePath}.tmp-${process.pid}-${Date.now()}`;
+  await fsp.writeFile(temporaryPath, text, "utf8");
+  await fsp.rename(temporaryPath, globalStatePath);
+  if (writeBackupState) await fsp.writeFile(`${globalStatePath}.bak`, text, "utf8");
+
+  return {
+    ok: true,
+    projects: Object.keys(localProjects).length,
+    assignments: Object.keys(assignments).length,
+    mappings: Object.keys(projectMappings).length,
+    backupStateUpdated: writeBackupState
+  };
+}
