@@ -11,7 +11,6 @@
     "init": "node bin/cli.mjs init",
     "install-hooks": "node bin/cli.mjs install-hooks",
     "sync": "node bin/cli.mjs sync",
-    "finalize-ui": "node bin/cli.mjs finalize-ui",
     "doctor": "node bin/cli.mjs doctor"
   },
   "engines": {

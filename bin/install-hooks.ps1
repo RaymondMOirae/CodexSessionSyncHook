@@ -87,4 +87,4 @@ if ($InstallLogonTask) {
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Description 'Pull, merge, import and refresh Codex conversation history.' -Force | Out-Null
 }
 
-Write-Host 'Hooks installed. Open /hooks in both Codex clients and trust the new hook definitions.'
+Write-Host 'Hooks installed. Open /hooks in each configured Codex client and trust the new hook definitions.'

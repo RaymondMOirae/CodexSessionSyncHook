@@ -45,8 +45,6 @@ Usage:
   codex-history-sync init --home NAME=PATH [--home NAME=PATH ...] [--data-repo PATH] [--remote URL] [--branch main]
   codex-history-sync install-hooks [--logon-task]
   codex-history-sync sync [--no-pull] [--no-push] [--no-commit]
-  codex-history-sync finalize-ui [HOME_NAME]
-  codex-history-sync watch-exit HOME_NAME
   codex-history-sync enqueue
   codex-history-sync doctor
 
@@ -119,24 +117,6 @@ async function main() {
     return;
   }
   if (command === "doctor") return doctor();
-  if (command === "finalize-ui") {
-    const result = await run(process.execPath, [path.join(repoRoot, "bin", "finalize-ui-state.mjs"), args[1]].filter(Boolean), { cwd: repoRoot });
-    process.exitCode = result.code;
-    return;
-  }
-  if (command === "watch-exit") {
-    if (!args[1]) throw new Error("watch-exit requires a home name");
-    const watchArgs = [path.join(repoRoot, "bin", "watch-home-exit.mjs"), args[1]];
-    const child = spawn(process.execPath, watchArgs, {
-      cwd: repoRoot,
-      detached: true,
-      windowsHide: true,
-      stdio: "ignore"
-    });
-    child.unref();
-    console.log(`Watching ${args[1]} for exit; UI metadata will be finalized afterward.`);
-    return;
-  }
   if (["sync", "start", "pull", "enqueue", "drain"].includes(command)) {
     const workerArgs = [path.join(repoRoot, "bin", "sync-history.mjs"), command, ...args.slice(1)];
     const result = await run(process.execPath, workerArgs, { cwd: repoRoot });

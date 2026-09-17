@@ -1,30 +1,35 @@
-# Codex History Sync
+# Codex Session Sync Hook
 
-一个可配置的 Git-backed Codex 会话同步工具。它可以把任意数量的 Codex Home
-（例如 `~/.codex`、`~/.customcodex` 或其他自定义 Codex Home）连接到用户自己的私有 Git 仓库。
+一个可配置的 Git-backed Codex 会话同步框架，用于在多台设备和多个 Codex Home 之间
+同步消息记录。默认面向官方 OpenAI Codex（`~/.codex`、`model_provider = "openai"`），
+同时允许用户配置其他 Codex-compatible Home 和不同 Provider。
 
-本仓库**只包含同步框架代码**：CLI、Codex 生命周期 Hook、Git Hook、冲突检测和
-Provider 刷新。聊天记录保存在用户指定的独立私有数据仓库中。
+本仓库只包含同步框架代码：CLI、Codex 生命周期 Hook、Git Hook、冲突检测、Provider
+元数据转换，以及会话名称和 Project 归属同步。聊天正文保存在用户指定的独立私有仓库中。
 
 > 会话正文可能包含源代码、路径、提示词和公司信息。数据仓库必须保持私有。
 
 ## 功能
 
-- 配置任意数量的 Codex Home。
-- 双向合并 `sessions`、`archived_sessions` 和 `session_index.jsonl`。
+- 配置一个或多个 Codex Home。
+- 在多台设备之间双向合并 `sessions`、`archived_sessions` 和 `session_index.jsonl`。
 - 使用 Git LFS 保存大型 rollout JSONL。
-- `SessionStart` 自动 pull、导入和刷新 Provider。
+- `SessionStart` 自动 fetch/rebase、导入会话、刷新 Provider 和线程索引。
 - `SessionEnd` 在后台防抖后 commit/push。
-- 可选在自定义客户端完全退出后再次落盘 UI 项目元数据，避免桌面宿主退出时用旧缓存覆盖同步结果。
-- 根据每个 Home 自己的 `config.toml` 保留不同 `model_provider`。
+- 未显式配置 `model_provider` 的 Home 默认按 OpenAI Provider 处理。
+- 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
+- 同步会话名称、Project 定义及线程的 Project 归属。
 - 活跃或最近仍在写入的会话延迟处理。
+- 一端历史是另一端前缀时保留较长版本。
 - 真正分叉的同一 session 保存到 `conflicts/<session-id>/`，不静默覆盖。
 - 不同步认证、配置、SQLite、WAL、日志、缓存和运行锁。
 
-## 典型用途：Codex 多端消息记录同步
+公开版本不修改桌面客户端快捷方式，也不要求通过前置 PowerShell 启动。针对某个定制客户端
+的启动缓存、退出回写或专用启动器应在该客户端自己的集成层中处理。
 
-本工具可以作为 Codex 在多台工作站之间的消息记录同步层。例如在台式机、笔记本和
-远程开发机上分别安装 Codex，再让每台设备连接同一个私有数据仓库：
+## 典型用途
+
+### 多设备同步官方 Codex
 
 ```text
 工作站 A ~/.codex ─┐
@@ -32,26 +37,30 @@ Provider 刷新。聊天记录保存在用户指定的独立私有数据仓库�
 工作站 C ~/.codex ─┘
 ```
 
-每台设备在 `SessionStart` 时拉取其他设备已经提交的会话，在 `SessionEnd` 时将本机新增
-或延长的会话提交回私有仓库。会话按 session ID 合并；一端内容是另一端前缀时保留较长
-版本，发生真正分叉时保存双方副本并要求人工选择，因此不会用“最后写入时间”静默覆盖
-另一台设备的消息记录。
+### 多 Home / 多 Provider
 
-同一台设备也可以同时配置多个 Codex Home，例如官方客户端与自定义客户端；多设备和
-多 Home 可以组合使用。所有设备应使用同一个私有仓库，并安装 Git LFS。
+```text
+~/.codex       provider: openai ─┐
+~/.customcodex provider: custom ─┼─ 私有 Git/LFS 数据仓库
+D:/AI/.codex   provider: openai ─┘
+```
+
+每台设备在 `SessionStart` 时拉取其他设备已经提交的记录，在 `SessionEnd` 时提交本机新增
+或延长的记录。会话按 session ID 合并；发生真正分叉时保留双方副本并要求人工处理。
+
+Project 同步只保存 Project 名称、根目录路径和会话归属，不复制工作目录中的源代码或其他
+文件。项目内容应继续通过 Git、云盘或其他文件同步方案分发；目标设备上对应目录需要存在。
 
 ## 快速开始
 
-### 1. 获取同步框架
+### 1. 获取框架
 
 ```powershell
-git clone <FRAMEWORK_REPOSITORY_URL> codex-history-sync
-cd codex-history-sync
+git clone https://github.com/RaymondMOirae/CodexSessionSyncHook.git
+cd CodexSessionSyncHook
 ```
 
 ### 2. 创建或克隆私有数据仓库
-
-数据仓库与框架仓库分开，例如：
 
 ```powershell
 git clone git@github.com:OWNER/PRIVATE-CODEX-HISTORY.git D:\Private\codex-history-data
@@ -59,7 +68,17 @@ git clone git@github.com:OWNER/PRIVATE-CODEX-HISTORY.git D:\Private\codex-histor
 
 数据仓库必须是私有仓库。空仓库也可以，初始化命令会补充 Git/LFS 配置。
 
-### 3. 配置参与同步的 Codex Home
+### 3. 初始化
+
+仅同步默认官方 Codex Home：
+
+```powershell
+node .\bin\cli.mjs init `
+  --data-repo D:\Private\codex-history-data `
+  --remote git@github.com:OWNER/PRIVATE-CODEX-HISTORY.git
+```
+
+配置多个 Home：
 
 ```powershell
 node .\bin\cli.mjs init `
@@ -69,27 +88,15 @@ node .\bin\cli.mjs init `
   --remote git@github.com:OWNER/PRIVATE-CODEX-HISTORY.git
 ```
 
-也可以直接编辑 `sync.config.json`：
+也可以直接编辑 `sync.config.json`。完整示例见 `sync.config.example.json`。
 
-```json
-{
-  "schemaVersion": 1,
-  "homes": [
-    { "name": "official", "path": "~/.codex", "installHooks": true },
-    { "name": "work", "path": "D:/AI/work-codex-home", "installHooks": true }
-  ]
-}
-```
-
-完整示例见 `sync.config.example.json`。
-
-### 4. 安装 Git Hook 与 Codex Hook
+### 4. 安装 Hooks
 
 ```powershell
 node .\bin\cli.mjs install-hooks --logon-task
 ```
 
-随后在每一个 Codex 客户端中运行 `/hooks`，检查并信任：
+随后在每个配置的 Codex 客户端中运行 `/hooks`，检查并信任：
 
 ```text
 Git-backed Codex conversation history synchronization
@@ -104,11 +111,9 @@ node .\bin\cli.mjs sync
 ## CLI
 
 ```text
-codex-history-sync init --home NAME=PATH [--home NAME=PATH ...] [--remote URL]
+codex-history-sync init --home NAME=PATH [--home NAME=PATH ...] [--data-repo PATH] [--remote URL] [--branch main]
 codex-history-sync install-hooks [--logon-task]
 codex-history-sync sync [--no-pull] [--no-push] [--no-commit]
-codex-history-sync finalize-ui [HOME_NAME]
-codex-history-sync watch-exit HOME_NAME
 codex-history-sync enqueue
 codex-history-sync doctor
 ```
@@ -125,18 +130,19 @@ codex-history-sync doctor
 |---|---|
 | `name` | 唯一名称，仅用于日志和诊断 |
 | `path` | 绝对路径、相对仓库路径或 `~` 路径 |
-| `installHooks` | 是否向该 Home 安装 `hooks.json`，默认 `true`；关闭后该 Home 仍参与读写同步 |
-| `finalizeUiOnExit` | 可选；为 `true` 时，`SessionEnd` 会启动退出监听器，在该客户端进程完全结束后重写 UI 项目状态 |
-| `uiStateExitProcessPaths` | 可选；需要等待退出的客户端/后端可执行文件路径列表；全部退出后才执行最终化 |
-| `uiStateExitCommandLineContains` | 可选；进一步按命令行片段筛选目标进程，避免同一可执行文件的辅助实例阻塞最终化 |
+| `installHooks` | 是否向该 Home 安装 `hooks.json`，默认 `true` |
 
-不限制 Home 数量。
+未指定 `--home` 时默认生成：
+
+```json
+{ "name": "codex", "path": "~/.codex", "installHooks": true }
+```
 
 ### `git`
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
-| `dataRepository` | `.` | 保存 `data/` 的私有 Git 工作区；可与工具源码目录分离 |
+| `dataRepository` | `.` | 保存 `data/` 的私有 Git 工作区 |
 | `remote` | `origin` | 私有数据仓库远端名称 |
 | `branch` | `main` | 同步分支 |
 | `autoPull` | `true` | 开始同步前 fetch/rebase |
@@ -145,8 +151,19 @@ codex-history-sync doctor
 
 ### `providerSync`
 
-工具内置 `codex-provider-sync v1.0.3`。导入后分别读取每个 Home 根级
-`model_provider`，再更新其 rollout 和已有 SQLite thread 行。
+框架内置 `codex-provider-sync`。每个 Home 从其 `config.toml` 根级读取 `model_provider`；
+没有显式值时默认使用 `openai`。导入记录后，框架会把 rollout 和已有 SQLite thread 行更新为
+目标 Home 的 Provider，从而允许不同 Home 使用不同 Provider。
+
+```json
+{
+  "providerSync": {
+    "enabled": true,
+    "entry": "vendor/codex-provider-sync/src/cli.js",
+    "onMissing": "warn"
+  }
+}
+```
 
 ### `sync`
 
@@ -155,64 +172,57 @@ codex-history-sync doctor
 | `includeArchived` | `true` | 同步归档会话 |
 | `includeSessionIndex` | `true` | 合并会话名称索引 |
 | `propagateDeletes` | `false` | 删除默认不传播 |
-| `refreshThreadIndex` | `true` | 导入后调用各 Home 的 Codex `thread/list`，补建客户端 UI 使用的 SQLite 线程索引 |
+| `refreshThreadIndex` | `true` | 导入后调用每个 Home 的 Codex `thread/list` 补建线程索引 |
 | `indexRefreshTimeoutSeconds` | `120` | 每个 Home 的索引刷新超时 |
-| `includeUiMetadata` | `true` | 同步会话名称、项目定义和线程的项目归属，避免导入记录全部落入 Quick Chat |
+| `includeUiMetadata` | `true` | 同步名称、Project 定义和线程的 Project 归属 |
 | `settleMilliseconds` | `1500` | 扫描前等待文件写入稳定 |
 | `lockStaleMinutes` | `30` | 同步锁过期时间 |
 
 ## 生命周期
 
 ```text
-SessionStart(startup/resume)
+Windows 登录
   → fetch/rebase
-  → 合并 Git 数据和所有 Codex Home
-  → 按各 Home Provider 回写
-  → 扫描 rollout 并刷新 UI 线程索引
-  → Provider metadata sync
-  → commit/push
+  → 合并数据仓库与所有 Codex Home
+  → 按目标 Home 转换 Provider 元数据
+  → 刷新线程索引及 UI 元数据
+
+SessionStart(startup/resume)
+  → 执行同样的同步流程
 
 SessionEnd
   → 3 秒内启动后台任务
   → 防抖
-  → 执行同样的同步流程
-  → 对启用 finalizeUiOnExit 的 Home 等待客户端完全退出
-  → 写入 .codex-global-state.json 及其 .bak，使下次启动载入完整项目列表
+  → 合并、commit、push
 ```
 
-Codex 用户级 Hook 在变更后需要通过 `/hooks` 重新信任。官方说明见
-[Codex Hooks](https://developers.openai.com/codex/hooks/)。
+官方说明中，`SessionStart` 在会话启动或恢复时运行；`SessionEnd` 在主会话真正结束时运行，
+切换离开对话不会立即结束 session。参考 [Codex Hooks](https://learn.chatgpt.com/docs/hooks)。
 
 ## 数据边界
 
-会提交：
+数据仓库会保存：
 
 ```text
 data/sessions/**/*.jsonl
 data/archived_sessions/**/*.jsonl
 data/session_index.jsonl
+data/ui-metadata.json
 ```
 
-永远不应提交 `auth.json`、`config.toml`、SQLite/WAL/SHM、全局状态、日志、缓存和锁。
-`.githooks/pre-commit` 会阻止这些文件被提交。
+永远不应提交：
 
-## 代码与数据的组织方式
-
-当前支持：
-
-1. **推荐的分离模式**：工具代码保留在本仓库，将 `git.dataRepository` 指向独立私有 Git 工作区。
-2. **兼容单仓库模式**：将 `git.dataRepository` 设置成 `.`，但这会把代码与聊天数据放在同一私有仓库，不建议用于公开框架仓库。
-
-分离模式的数据仓库至少应包含：
-
-```gitattributes
-data/sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text
-data/archived_sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text
-data/session_index.jsonl text eol=lf
+```text
+auth.json
+config.toml
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.codex-global-state.json
+日志、缓存和锁
 ```
 
-代码已经不依赖固定用户名或固定 `.codex/.customcodex` 数量。未来可以进一步发布成 npm
-工具，让代码全局安装，而数据仓库仅保存 `data/` 与用户配置。
+`.githooks/pre-commit` 会阻止敏感运行时文件进入数据仓库。
 
 ## 日志与冲突
 
@@ -223,4 +233,4 @@ conflicts/<session-id>/
 
 ## 上游组件
 
-`vendor/codex-provider-sync` 固定自上游 `v1.0.3`，仅负责 Provider 元数据同步。
+`vendor/codex-provider-sync` 固定自上游版本，只负责 Provider 元数据转换和同步。
