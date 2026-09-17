@@ -13,6 +13,9 @@
       "finalizeUiOnExit": true,
       "uiStateExitProcessPaths": [
         "C:/Path/To/CustomCodex/codex.exe"
+      ],
+      "uiStateExitCommandLineContains": [
+        "app-server"
       ]
     }
   ],

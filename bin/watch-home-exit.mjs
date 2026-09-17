@@ -32,8 +32,10 @@ async function clientProcesses(home) {
   const configured = home.uiStateExitProcessPaths ?? [];
   if (configured.length === 0) return [];
   const roots = configured.map((value) => path.resolve(value).replaceAll("'", "''").toLowerCase());
+  const markers = (home.uiStateExitCommandLineContains ?? []).map((value) => String(value).replaceAll("'", "''").toLowerCase());
   const rootsLiteral = roots.map((value) => `'${value}'`).join(",");
-  const script = `$roots=@(${rootsLiteral}); Get-CimInstance Win32_Process | Where-Object { $p=$_.ExecutablePath; $p -and ($roots | Where-Object { $p.ToLowerInvariant().StartsWith($_) } | Select-Object -First 1) } | Select-Object -ExpandProperty ProcessId`;
+  const markersLiteral = markers.map((value) => `'${value}'`).join(",");
+  const script = `$roots=@(${rootsLiteral}); $markers=@(${markersLiteral}); Get-CimInstance Win32_Process | Where-Object { $p=$_.ExecutablePath; $c=$_.CommandLine; $pathMatch=$p -and ($roots | Where-Object { $p.ToLowerInvariant().StartsWith($_) } | Select-Object -First 1); $markerMatch=$markers.Count -eq 0 -or ($c -and ($markers | Where-Object { $c.ToLowerInvariant().Contains($_) } | Select-Object -First 1)); $pathMatch -and $markerMatch } | Select-Object -ExpandProperty ProcessId`;
   const result = await run("powershell.exe", ["-NoProfile", "-Command", script]);
   if (result.code !== 0) return [];
   return result.stdout.split(/\r?\n/).map((value) => Number(value.trim())).filter(Number.isInteger);

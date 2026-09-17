@@ -128,6 +128,7 @@ codex-history-sync doctor
 | `installHooks` | 是否向该 Home 安装 `hooks.json`，默认 `true`；关闭后该 Home 仍参与读写同步 |
 | `finalizeUiOnExit` | 可选；为 `true` 时，`SessionEnd` 会启动退出监听器，在该客户端进程完全结束后重写 UI 项目状态 |
 | `uiStateExitProcessPaths` | 可选；需要等待退出的客户端/后端可执行文件路径列表；全部退出后才执行最终化 |
+| `uiStateExitCommandLineContains` | 可选；进一步按命令行片段筛选目标进程，避免同一可执行文件的辅助实例阻塞最终化 |
 
 不限制 Home 数量。
 
