@@ -16,6 +16,7 @@
 - 使用 Git LFS 保存大型 rollout JSONL。
 - `SessionStart` 自动 fetch/rebase、导入会话、刷新 Provider 和线程索引。
 - `SessionEnd` 在后台防抖后 commit/push。
+- 将 archive/unarchive 作为独立状态事件同步，避免旧的 active 副本让归档对话重新出现。
 - 未显式配置 `model_provider` 的 Home 默认按 OpenAI Provider 处理。
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
@@ -208,6 +209,7 @@ data/sessions/**/*.jsonl
 data/archived_sessions/**/*.jsonl
 data/session_index.jsonl
 data/ui-metadata.json
+data/archive-events/<session-id>/*.json
 ```
 
 永远不应提交：

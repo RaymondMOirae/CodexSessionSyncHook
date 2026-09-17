@@ -98,9 +98,16 @@ export async function installRepositoryHooks(repoRoot) {
     await fs.writeFile(path.join(hooksRoot, "post-rewrite"), `#!/bin/sh\n${syncHookLine}\n`, "utf8");
     await fs.writeFile(path.join(hooksRoot, "pre-commit"), `#!/bin/sh\nset -eu\nblocked='(^|/)(auth\\.json|config\\.toml|.*\\.sqlite(-wal|-shm)?|\\.codex-global-state\\.json)$'\nif git diff --cached --name-only | grep -E "$blocked" >/dev/null 2>&1; then\n  echo "Refusing commit: sensitive Codex runtime files are staged." >&2\n  exit 1\nfi\n`, "utf8");
     const attributesPath = path.join(dataRepoRoot, ".gitattributes");
-    if (!(await exists(attributesPath))) {
-      await fs.writeFile(attributesPath, "data/sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text\ndata/archived_sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text\ndata/session_index.jsonl text eol=lf\n", "utf8");
-    }
+    const requiredAttributes = [
+      "data/sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text",
+      "data/archived_sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text",
+      "data/session_index.jsonl text eol=lf",
+      "data/archive-events/**/*.json text eol=lf"
+    ];
+    const existingAttributes = await fs.readFile(attributesPath, "utf8").catch(() => "");
+    const attributeLines = new Set(existingAttributes.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+    for (const line of requiredAttributes) attributeLines.add(line);
+    await fs.writeFile(attributesPath, `${[...attributeLines].join("\n")}\n`, "utf8");
     const ignorePath = path.join(dataRepoRoot, ".gitignore");
     if (!(await exists(ignorePath))) await fs.writeFile(ignorePath, ".sync/\nconflicts/\n", "utf8");
     const hooks = await run("git", ["config", "core.hooksPath", ".githooks"], { cwd: dataRepoRoot });

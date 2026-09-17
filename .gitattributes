@@ -2,4 +2,5 @@
 *.mjs text eol=lf
 *.ps1 text eol=crlf
 *.json text eol=lf
+data/archive-events/**/*.json text eol=lf
 .githooks/* text eol=lf

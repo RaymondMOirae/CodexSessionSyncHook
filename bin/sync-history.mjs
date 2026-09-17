@@ -26,6 +26,14 @@ let command = args[0] ?? "sync";
 if (command === "run") command = args[1] ?? "sync";
 const hasFlag = (name) => args.includes(name);
 
+function normalizePath(value) {
+  let normalized = String(value ?? "").replace(/^\\\\\?\\/, "");
+  if (process.platform === "win32" || /^[A-Za-z]:[\\/]/.test(normalized) || normalized.startsWith("\\\\")) {
+    return path.win32.normalize(normalized).toLowerCase();
+  }
+  return path.posix.normalize(normalized.replaceAll("\\", "/"));
+}
+
 function timestamp() {
   return new Date().toISOString();
 }
@@ -413,13 +421,294 @@ async function buildIndex(root, bucket) {
       continue;
     }
     const stat = await fsp.stat(filePath);
-    const candidate = { filePath, bucket, meta, stat };
+    const candidate = { filePath, bucket, meta, stat, allPaths: [filePath] };
     const current = index.get(meta.id);
-    if (!current || candidate.stat.mtimeMs > current.stat.mtimeMs || (candidate.stat.mtimeMs === current.stat.mtimeMs && candidate.stat.size > current.stat.size)) {
+    if (!current) {
       index.set(meta.id, candidate);
+    } else if (candidate.stat.mtimeMs > current.stat.mtimeMs || (candidate.stat.mtimeMs === current.stat.mtimeMs && candidate.stat.size > current.stat.size)) {
+      candidate.allPaths = [...(current.allPaths ?? [current.filePath]), filePath];
+      index.set(meta.id, candidate);
+    } else {
+      current.allPaths = [...(current.allPaths ?? [current.filePath]), filePath];
     }
   }
   return index;
+}
+
+async function readJson(filePath, fallback) {
+  try { return JSON.parse(await fsp.readFile(filePath, "utf8")); } catch { return fallback; }
+}
+
+function observedArchiveStates(candidatesById, sourceName) {
+  const states = new Map();
+  for (const [id, candidates] of candidatesById) {
+    const buckets = new Set(candidates.filter((candidate) => candidate.sourceName === sourceName).map((candidate) => candidate.bucket));
+    if (buckets.has("archived_sessions")) states.set(id, true);
+    else if (buckets.has("sessions")) states.set(id, false);
+  }
+  return states;
+}
+
+function archiveObservationPath(home) {
+  const key = crypto.createHash("sha256").update(`${home.name}\0${home.path}`).digest("hex").slice(0, 16);
+  return path.join(stateDir, "archive-observations", `${home.name.replace(/[^A-Za-z0-9._-]/g, "_")}-${key}.json`);
+}
+
+async function archiveDeviceId() {
+  const deviceIdPath = path.join(stateDir, "device-id");
+  const current = (await fsp.readFile(deviceIdPath, "utf8").catch(() => "")).trim();
+  if (current) return current;
+  const created = crypto.randomUUID();
+  await fsp.mkdir(stateDir, { recursive: true });
+  await fsp.writeFile(deviceIdPath, `${created}\n`, { encoding: "utf8", flag: "wx" }).catch(() => {});
+  return (await fsp.readFile(deviceIdPath, "utf8").catch(() => created)).trim() || created;
+}
+
+async function sqliteArchiveStates(home) {
+  const dbPath = [path.join(home.path, "state_5.sqlite"), path.join(home.path, "sqlite", "state_5.sqlite")].find((candidate) => fs.existsSync(candidate));
+  if (!dbPath) return new Map();
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return new Map(db.prepare("SELECT id, archived FROM threads").all().map((row) => [row.id, Boolean(row.archived)]));
+    } finally {
+      db.close();
+    }
+  } catch {
+    return new Map();
+  }
+}
+
+async function readHomeArchiveStates(home, candidatesById) {
+  const states = observedArchiveStates(candidatesById, home.name);
+  const databaseStates = await sqliteArchiveStates(home);
+  for (const [id, archived] of databaseStates) if (states.has(id)) states.set(id, archived);
+  return states;
+}
+
+function newerArchiveEvent(current, candidate) {
+  if (!current) return candidate;
+  if (candidate.observedAtMs !== current.observedAtMs) return candidate.observedAtMs > current.observedAtMs ? candidate : current;
+  if (candidate.archived !== current.archived) return candidate.archived ? candidate : current;
+  return String(candidate.source).localeCompare(String(current.source)) > 0 ? candidate : current;
+}
+
+async function loadArchiveEvents() {
+  const root = path.join(dataRepoRoot, "data", "archive-events");
+  const latest = new Map();
+  for (const filePath of await walkFiles(root, ".json")) {
+    const event = await readJson(filePath, null);
+    if (typeof event?.id !== "string" || typeof event?.archived !== "boolean") continue;
+    const observedAtMs = Number(event.observedAtMs) || Date.parse(event.observedAt ?? "") || 0;
+    const normalized = { id: event.id, archived: event.archived, observedAtMs, source: event.source ?? "unknown" };
+    latest.set(event.id, newerArchiveEvent(latest.get(event.id), normalized));
+  }
+  return latest;
+}
+
+async function appendArchiveEvent(event) {
+  const safeId = event.id.replace(/[^A-Za-z0-9._-]/g, "_");
+  const root = path.join(dataRepoRoot, "data", "archive-events", safeId);
+  await fsp.mkdir(root, { recursive: true });
+  const fileName = `${String(event.observedAtMs).padStart(13, "0")}-${event.source.replace(/[^A-Za-z0-9._-]/g, "_")}-${crypto.randomUUID()}.json`;
+  await fsp.writeFile(path.join(root, fileName), `${JSON.stringify(event, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+}
+
+async function resolveArchiveStates(config, candidatesById) {
+  const deviceId = await archiveDeviceId();
+  const latestEvents = await loadArchiveEvents();
+  const observations = new Map();
+  const snapshots = new Map();
+  for (const home of config.homes) {
+    observations.set(home.name, await readHomeArchiveStates(home, candidatesById));
+    snapshots.set(home.name, (await readJson(archiveObservationPath(home), { states: {} })).states ?? {});
+  }
+  const canonicalObserved = observedArchiveStates(candidatesById, "git");
+  const ids = new Set([...candidatesById.keys(), ...latestEvents.keys()]);
+  const changedIds = new Set();
+  let eventsWritten = 0;
+  for (const id of ids) {
+    const localChanges = [];
+    const initialStates = [];
+    for (const home of config.homes) {
+      const actual = observations.get(home.name).get(id);
+      if (typeof actual !== "boolean") continue;
+      initialStates.push(actual);
+      const prior = snapshots.get(home.name)[id];
+      if (typeof prior === "boolean" && prior !== actual && latestEvents.get(id)?.archived !== actual) localChanges.push({ home: home.name, archived: actual });
+    }
+    if (canonicalObserved.has(id)) initialStates.push(canonicalObserved.get(id));
+    if (localChanges.length > 0) {
+      const values = new Set(localChanges.map((entry) => entry.archived));
+      const archived = values.size === 1 ? localChanges[0].archived : true;
+      const observedAtMs = Math.max(Date.now(), (latestEvents.get(id)?.observedAtMs ?? 0) + 1);
+      const source = values.size === 1 ? localChanges.map((entry) => entry.home).sort().join(",") : "conflict:archive-wins";
+      const event = { schemaVersion: 1, id, archived, observedAt: new Date(observedAtMs).toISOString(), observedAtMs, source: `${deviceId}:${source}` };
+      await appendArchiveEvent(event);
+      latestEvents.set(id, newerArchiveEvent(latestEvents.get(id), event));
+      eventsWritten += 1;
+      changedIds.add(id);
+    } else if (!latestEvents.has(id) && initialStates.length > 0) {
+      const observedAtMs = Date.now();
+      const event = { schemaVersion: 1, id, archived: initialStates.some(Boolean), observedAt: new Date(observedAtMs).toISOString(), observedAtMs, source: `${deviceId}:bootstrap` };
+      await appendArchiveEvent(event);
+      latestEvents.set(id, event);
+      eventsWritten += 1;
+    }
+  }
+  const archivedById = new Map([...latestEvents].map(([id, event]) => [id, event.archived]));
+  const needsApplyIds = new Set();
+  for (const [id, archived] of archivedById) {
+    if (canonicalObserved.has(id) && canonicalObserved.get(id) !== archived) needsApplyIds.add(id);
+    for (const observed of observations.values()) if (observed.has(id) && observed.get(id) !== archived) needsApplyIds.add(id);
+  }
+  return {
+    archivedById,
+    observations,
+    changedIds,
+    needsApplyIds,
+    eventsWritten
+  };
+}
+
+async function writeArchiveState(config, archiveState) {
+  for (const home of config.homes) {
+    const observed = archiveState.observations.get(home.name) ?? new Map();
+    const snapshotPath = archiveObservationPath(home);
+    await fsp.mkdir(path.dirname(snapshotPath), { recursive: true });
+    await fsp.writeFile(snapshotPath, `${JSON.stringify({
+      schemaVersion: 1,
+      observedAt: timestamp(),
+      states: Object.fromEntries(observed)
+    }, null, 2)}\n`, "utf8");
+  }
+}
+
+async function writeArchiveSnapshots(config, statesByHome) {
+  for (const home of config.homes) {
+    const snapshotPath = archiveObservationPath(home);
+    await fsp.mkdir(path.dirname(snapshotPath), { recursive: true });
+    await fsp.writeFile(snapshotPath, `${JSON.stringify({
+      schemaVersion: 1,
+      observedAt: timestamp(),
+      states: Object.fromEntries(statesByHome.get(home.name) ?? new Map())
+    }, null, 2)}\n`, "utf8");
+  }
+}
+
+function normalizeExistingPath(filePath) {
+  return process.platform === "win32" ? String(filePath ?? "").replace(/^\\\\\?\\/, "") : String(filePath ?? "");
+}
+
+async function synchronizeArchiveDatabase(home, archivedById, candidatesById) {
+  const dbPath = [path.join(home.path, "state_5.sqlite"), path.join(home.path, "sqlite", "state_5.sqlite")].find((candidate) => fs.existsSync(candidate));
+  if (!dbPath) return { skipped: true, reason: "state-db-not-found" };
+  const { DatabaseSync, backup: sqliteBackup } = await import("node:sqlite");
+  const desiredRows = [];
+  const readDb = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    for (const row of readDb.prepare("SELECT id, archived, rollout_path FROM threads").all()) {
+      if (!archivedById.has(row.id)) continue;
+      const archived = archivedById.get(row.id);
+      const desiredBucket = archived ? "archived_sessions" : "sessions";
+      const rolloutPath = (candidatesById.get(row.id) ?? []).find((candidate) => candidate.sourceName === home.name && candidate.bucket === desiredBucket)?.filePath;
+      if (!rolloutPath) continue;
+      if (Boolean(row.archived) !== archived || normalizePath(row.rollout_path) !== normalizePath(rolloutPath)) desiredRows.push({ id: row.id, archived, rolloutPath });
+    }
+  } finally {
+    readDb.close();
+  }
+  if (desiredRows.length === 0) return { ok: true, updates: 0 };
+
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  const backupRoot = path.join(home.path, "backups_state", "archive-state", stamp);
+  await fsp.mkdir(backupRoot, { recursive: true });
+  const backupDb = new DatabaseSync(dbPath, { readOnly: true });
+  try { await sqliteBackup(backupDb, path.join(backupRoot, "state_5.sqlite")); } finally { backupDb.close(); }
+
+  const db = new DatabaseSync(dbPath);
+  let updates = 0;
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    const update = db.prepare("UPDATE threads SET archived = ?, archived_at = CASE WHEN ? = 1 THEN COALESCE(archived_at, CAST(strftime('%s','now') AS INTEGER)) ELSE NULL END, rollout_path = ? WHERE id = ? AND (archived <> ? OR rollout_path <> ?)");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of desiredRows) {
+        const result = update.run(row.archived ? 1 : 0, row.archived ? 1 : 0, row.rolloutPath, row.id, row.archived ? 1 : 0, row.rolloutPath);
+        updates += Number(result.changes ?? 0);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    db.close();
+  }
+  return { ok: true, updates, backupDir: backupRoot };
+}
+
+function rolloutPathMatchesBucket(home, rolloutPath, bucket) {
+  if (typeof rolloutPath !== "string" || !rolloutPath) return false;
+  const normalizedPath = normalizePath(rolloutPath);
+  const normalizedRoot = normalizePath(path.join(home.path, bucket));
+  const separator = process.platform === "win32" ? "\\" : "/";
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}${separator}`);
+}
+
+async function archiveStatesMatchDatabases(config, archivedById) {
+  for (const home of config.homes) {
+    const dbPath = [path.join(home.path, "state_5.sqlite"), path.join(home.path, "sqlite", "state_5.sqlite")].find((candidate) => fs.existsSync(candidate));
+    if (!dbPath) continue;
+    try {
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        for (const row of db.prepare("SELECT id, archived, rollout_path FROM threads").all()) {
+          if (!archivedById.has(row.id)) continue;
+          const archived = archivedById.get(row.id);
+          const desiredBucket = archived ? "archived_sessions" : "sessions";
+          if (Boolean(row.archived) !== archived || !rolloutPathMatchesBucket(home, row.rollout_path, desiredBucket) || !fs.existsSync(normalizeExistingPath(row.rollout_path))) return false;
+        }
+      } finally {
+        db.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function moveOppositeCopies(candidates, sourceName, sourceRoot, desiredBucket, keepPath) {
+  let moves = 0;
+  for (const candidate of candidates) {
+    if (candidate.sourceName !== sourceName || candidate.bucket === desiredBucket) continue;
+    for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
+      if (path.resolve(filePath) === path.resolve(keepPath)) continue;
+      const meta = await readSessionMeta(filePath);
+      const stat = await fsp.stat(filePath);
+      const relative = desiredBucket === "sessions"
+        ? chooseCanonicalRelative({ bucket: "sessions", filePath, meta: meta ?? candidate.meta, stat })
+        : path.basename(filePath);
+      let destination = path.join(sourceRoot, desiredBucket, relative);
+      if (await exists(destination)) {
+        if (await canonicalDigest(destination) === await canonicalDigest(filePath)) {
+          await fsp.rm(filePath, { force: true });
+          moves += 1;
+          continue;
+        }
+        const extension = path.extname(destination);
+        const suffix = crypto.createHash("sha256").update(filePath).digest("hex").slice(0, 8);
+        destination = `${destination.slice(0, -extension.length)}-${suffix}${extension}`;
+      }
+      await copyAtomic(filePath, destination);
+      await fsp.rm(filePath, { force: true });
+      moves += 1;
+    }
+  }
+  return moves;
 }
 
 function chooseCanonicalRelative(candidate) {
@@ -520,14 +809,18 @@ async function mergeSessionIndex(config) {
 
 async function synchronizeFiles(config) {
   const grouped = await collectAllCandidates(config);
+  const archiveState = config.sync.includeArchived === false
+    ? { archivedById: new Map(), observations: new Map(), changedIds: new Set(), needsApplyIds: new Set(), eventsWritten: 0, disabled: true }
+    : await resolveArchiveStates(config, grouped);
   const active = await collectActiveThreadIds(config);
   const homeProviders = new Map();
   for (const home of config.homes) homeProviders.set(home.name, await readConfiguredProvider(home.path));
   let copiedToCanonical = 0;
   let copiedToHomes = 0;
   let conflicts = 0;
+  let archiveMoves = 0;
   for (const [id, candidates] of grouped) {
-    if (active.has(id)) {
+    if (active.has(id) && !archiveState.changedIds.has(id)) {
       await log(`defer active session ${id}`);
       continue;
     }
@@ -536,8 +829,9 @@ async function synchronizeFiles(config) {
       conflicts += 1;
       continue;
     }
-    const bucketRoot = canonicalRoots[winner.bucket];
-    const relative = winner.bucket === "sessions" ? chooseCanonicalRelative(winner) : path.basename(winner.filePath);
+    const desiredBucket = archiveState.disabled ? winner.bucket : archiveState.archivedById.get(id) ? "archived_sessions" : "sessions";
+    const bucketRoot = canonicalRoots[desiredBucket];
+    const relative = desiredBucket === "sessions" ? chooseCanonicalRelative({ ...winner, bucket: "sessions" }) : path.basename(winner.filePath);
     let canonicalPath = path.join(bucketRoot, relative);
     if (await exists(canonicalPath)) {
       const existingMeta = await readSessionMeta(canonicalPath);
@@ -550,8 +844,15 @@ async function synchronizeFiles(config) {
       await copyAtomic(winner.filePath, canonicalPath);
       copiedToCanonical += 1;
     }
+    for (const candidate of candidates.filter((entry) => entry.sourceName === "git" && entry.bucket === desiredBucket)) {
+      for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
+        if (path.resolve(filePath) === path.resolve(canonicalPath)) continue;
+        if (await canonicalDigest(filePath) === await canonicalDigest(canonicalPath)) await fsp.rm(filePath, { force: true });
+      }
+    }
+    archiveMoves += await moveOppositeCopies(candidates, "git", path.join(dataRepoRoot, "data"), desiredBucket, canonicalPath);
     for (const home of config.homes) {
-      let destination = winner.bucket === "sessions"
+      let destination = desiredBucket === "sessions"
         ? path.join(home.path, "sessions", relative)
         : path.join(home.path, "archived_sessions", path.basename(canonicalPath));
       if (await exists(destination)) {
@@ -566,10 +867,29 @@ async function synchronizeFiles(config) {
         await copySessionForProvider(canonicalPath, destination, targetProvider);
         copiedToHomes += 1;
       }
+      for (const candidate of candidates.filter((entry) => entry.sourceName === home.name && entry.bucket === desiredBucket)) {
+        for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
+          if (path.resolve(filePath) === path.resolve(destination)) continue;
+          if (await canonicalDigest(filePath) === await canonicalDigest(destination)) await fsp.rm(filePath, { force: true });
+        }
+      }
+      archiveMoves += await moveOppositeCopies(candidates, home.name, home.path, desiredBucket, destination);
     }
   }
   await mergeSessionIndex(config);
-  return { sessions: grouped.size, copiedToCanonical, copiedToHomes, conflicts };
+  const archiveDatabaseUpdates = {};
+  let archiveDatabaseConsistent = true;
+  if (!archiveState.disabled) {
+    const reconciledCandidates = await collectAllCandidates(config);
+    for (const home of config.homes) archiveDatabaseUpdates[home.name] = await synchronizeArchiveDatabase(home, archiveState.archivedById, reconciledCandidates);
+    archiveDatabaseConsistent = await archiveStatesMatchDatabases(config, archiveState.archivedById);
+    if (archiveDatabaseConsistent) {
+      const reconciledObservations = new Map();
+      for (const home of config.homes) reconciledObservations.set(home.name, await readHomeArchiveStates(home, reconciledCandidates));
+      await writeArchiveSnapshots(config, reconciledObservations);
+    }
+  }
+  return { sessions: grouped.size, copiedToCanonical, copiedToHomes, conflicts, archiveMoves, archiveEventsWritten: archiveState.eventsWritten, archiveDatabaseUpdates, archiveDatabaseConsistent };
 }
 
 async function refreshProvider(config, home) {
