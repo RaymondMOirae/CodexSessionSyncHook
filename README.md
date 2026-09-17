@@ -21,8 +21,9 @@
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
 - 活跃或最近仍在写入的会话延迟处理。
+- 保留分页会话同一 thread 下的全部物理 rollout，避免续段覆盖其 `history_base` 前置段。
 - 一端历史是另一端前缀时保留较长版本。
-- 真正分叉的同一 session 保存到 `conflicts/<session-id>/`，不静默覆盖。
+- 真正分叉的同一 rollout 保存到 `conflicts/<rollout-id>/`，不静默覆盖。
 - 不同步认证、配置、SQLite、WAL、日志、缓存和运行锁。
 
 公开版本不修改桌面客户端快捷方式，也不要求通过前置 PowerShell 启动。针对某个定制客户端
@@ -47,7 +48,8 @@ D:/AI/.codex   provider: openai ─┘
 ```
 
 每台设备在 `SessionStart` 时拉取其他设备已经提交的记录，在 `SessionEnd` 时提交本机新增
-或延长的记录。会话按 session ID 合并；发生真正分叉时保留双方副本并要求人工处理。
+或延长的记录。框架按物理 rollout ID 合并文件，同时按 thread ID 同步归档和 UI 元数据；
+分页会话的前置段与续段会一起保留，发生真正分叉时保留双方副本并要求人工处理。
 
 Project 同步只保存 Project 名称、根目录路径和会话归属，不复制工作目录中的源代码或其他
 文件。项目内容应继续通过 Git、云盘或其他文件同步方案分发；目标设备上对应目录需要存在。
@@ -231,7 +233,7 @@ config.toml
 
 ```text
 .sync/sync.log
-conflicts/<session-id>/
+conflicts/<rollout-id>/
 ```
 
 ## 上游组件

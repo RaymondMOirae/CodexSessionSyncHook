@@ -206,10 +206,15 @@ async function readSessionMeta(filePath) {
     const payload = parsed?.payload ?? parsed;
     const id = payload?.id ?? payload?.session_id ?? payload?.thread_id;
     if (typeof id !== "string" || !id) return null;
+    const rolloutIds = path.basename(filePath, path.extname(filePath)).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? [];
+    const rolloutId = rolloutIds.at(-1) ?? id;
     return {
       id,
+      rolloutId,
       provider: typeof payload.model_provider === "string" ? payload.model_provider : null,
-      timestamp: typeof payload.timestamp === "string" ? payload.timestamp : null
+      timestamp: typeof payload.timestamp === "string" ? payload.timestamp : null,
+      ordinal: Number.isSafeInteger(parsed?.ordinal) ? parsed.ordinal : 0,
+      historyBase: payload?.history_base && typeof payload.history_base === "object" ? payload.history_base : null
     };
   } catch {
     return null;
@@ -412,19 +417,29 @@ function normalizedFirstLineBuffer(buffer) {
 async function canonicalDigest(filePath, stripEncryptedContent = true) {
   const hash = crypto.createHash("sha256");
   for await (const line of await transformedLines(filePath, { targetProvider: "__SYNC_PROVIDER__", stripEncryptedContent })) {
+    // JSONL readers ignore blank records. Excluding them also keeps padded
+    // lineage sources equivalent when provider names have different lengths.
+    if (line.trim() === "") continue;
     hash.update(line);
     hash.update("\n");
   }
   return hash.digest("hex");
 }
 
+async function nextPortableRecord(iterator) {
+  for (;;) {
+    const entry = await iterator.next();
+    if (entry.done || entry.value.trim() !== "") return entry;
+  }
+}
+
 async function providerAgnosticPrefix(longerPath, shorterPath, stripEncryptedContent = true) {
   const longer = (await transformedLines(longerPath, { targetProvider: "__SYNC_PROVIDER__", stripEncryptedContent }))[Symbol.asyncIterator]();
   const shorter = (await transformedLines(shorterPath, { targetProvider: "__SYNC_PROVIDER__", stripEncryptedContent }))[Symbol.asyncIterator]();
   for (;;) {
-    const shortLine = await shorter.next();
+    const shortLine = await nextPortableRecord(shorter);
     if (shortLine.done) return true;
-    const longLine = await longer.next();
+    const longLine = await nextPortableRecord(longer);
     if (longLine.done || longLine.value !== shortLine.value) return false;
   }
 }
@@ -477,12 +492,12 @@ async function buildIndex(root, bucket) {
     }
     const stat = await fsp.stat(filePath);
     const candidate = { filePath, bucket, meta, stat, allPaths: [filePath] };
-    const current = index.get(meta.id);
+    const current = index.get(meta.rolloutId);
     if (!current) {
-      index.set(meta.id, candidate);
+      index.set(meta.rolloutId, candidate);
     } else if (candidate.stat.mtimeMs > current.stat.mtimeMs || (candidate.stat.mtimeMs === current.stat.mtimeMs && candidate.stat.size > current.stat.size)) {
       candidate.allPaths = [...(current.allPaths ?? [current.filePath]), filePath];
-      index.set(meta.id, candidate);
+      index.set(meta.rolloutId, candidate);
     } else {
       current.allPaths = [...(current.allPaths ?? [current.filePath]), filePath];
     }
@@ -667,7 +682,10 @@ async function synchronizeArchiveDatabase(home, archivedById, candidatesById) {
       if (!archivedById.has(row.id)) continue;
       const archived = archivedById.get(row.id);
       const desiredBucket = archived ? "archived_sessions" : "sessions";
-      const rolloutPath = (candidatesById.get(row.id) ?? []).find((candidate) => candidate.sourceName === home.name && candidate.bucket === desiredBucket)?.filePath;
+      const eligible = (candidatesById.get(row.id) ?? []).filter((candidate) => candidate.sourceName === home.name && candidate.bucket === desiredBucket);
+      const currentBaseName = path.basename(normalizeExistingPath(row.rollout_path));
+      const rolloutPath = eligible.find((candidate) => path.basename(candidate.filePath) === currentBaseName)?.filePath
+        ?? eligible.sort((a, b) => b.meta.ordinal - a.meta.ordinal || b.stat.mtimeMs - a.stat.mtimeMs || b.stat.size - a.stat.size)[0]?.filePath;
       if (!rolloutPath) continue;
       if (Boolean(row.archived) !== archived || normalizePath(row.rollout_path) !== normalizePath(rolloutPath)) desiredRows.push({ id: row.id, archived, rolloutPath });
     }
@@ -794,6 +812,18 @@ async function collectAllCandidates(config) {
   return grouped;
 }
 
+function groupCandidatesByThread(candidatesByRollout) {
+  const grouped = new Map();
+  for (const candidates of candidatesByRollout.values()) {
+    for (const candidate of candidates) {
+      const list = grouped.get(candidate.meta.id) ?? [];
+      list.push(candidate);
+      grouped.set(candidate.meta.id, list);
+    }
+  }
+  return grouped;
+}
+
 async function collectActiveThreadIds(config) {
   const active = new Set();
   for (const home of config.homes) {
@@ -877,9 +907,10 @@ async function mergeSessionIndex(config) {
 
 async function synchronizeFiles(config) {
   const grouped = await collectAllCandidates(config);
+  const candidatesByThread = groupCandidatesByThread(grouped);
   const archiveState = config.sync.includeArchived === false
     ? { archivedById: new Map(), observations: new Map(), changedIds: new Set(), needsApplyIds: new Set(), eventsWritten: 0, disabled: true }
-    : await resolveArchiveStates(config, grouped);
+    : await resolveArchiveStates(config, candidatesByThread);
   const active = await collectActiveThreadIds(config);
   const locked = await collectLockedThreadIds(config);
   const homeProviders = new Map();
@@ -888,26 +919,29 @@ async function synchronizeFiles(config) {
   let copiedToHomes = 0;
   let conflicts = 0;
   let archiveMoves = 0;
-  for (const [id, candidates] of grouped) {
-    const archiveTransition = archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id);
-    if (active.has(id) && (!archiveTransition || locked.has(id))) {
-      await log(`defer active session ${id}`);
+  for (const [rolloutId, candidates] of grouped) {
+    const threadIds = new Set(candidates.map((candidate) => candidate.meta.id));
+    const archiveTransition = [...threadIds].some((id) => archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id));
+    const activeThreadId = [...threadIds].find((id) => active.has(id));
+    if (activeThreadId && (!archiveTransition || [...threadIds].some((id) => locked.has(id)))) {
+      await log(`defer active session ${activeThreadId} rollout ${rolloutId}`);
       continue;
     }
-    const winner = await selectWinner(id, candidates, config.sync.stripEncryptedContent);
+    const winner = await selectWinner(rolloutId, candidates, config.sync.stripEncryptedContent);
     if (!winner) {
       conflicts += 1;
       continue;
     }
-    const desiredBucket = archiveState.disabled ? winner.bucket : archiveState.archivedById.get(id) ? "archived_sessions" : "sessions";
+    const threadId = winner.meta.id;
+    const desiredBucket = archiveState.disabled ? winner.bucket : archiveState.archivedById.get(threadId) ? "archived_sessions" : "sessions";
     const bucketRoot = canonicalRoots[desiredBucket];
     const relative = desiredBucket === "sessions" ? chooseCanonicalRelative({ ...winner, bucket: "sessions" }) : path.basename(winner.filePath);
     let canonicalPath = path.join(bucketRoot, relative);
     if (await exists(canonicalPath)) {
       const existingMeta = await readSessionMeta(canonicalPath);
-      if (existingMeta?.id && existingMeta.id !== id) {
+      if (existingMeta?.rolloutId && existingMeta.rolloutId !== rolloutId) {
         const extension = path.extname(canonicalPath);
-        canonicalPath = `${canonicalPath.slice(0, -extension.length)}-${id}${extension}`;
+        canonicalPath = `${canonicalPath.slice(0, -extension.length)}-${rolloutId}${extension}`;
       }
     }
     const winnerCanonicalDigest = await canonicalDigest(winner.filePath, false);
@@ -928,9 +962,9 @@ async function synchronizeFiles(config) {
         : path.join(home.path, "archived_sessions", path.basename(canonicalPath));
       if (await exists(destination)) {
         const existingMeta = await readSessionMeta(destination);
-        if (existingMeta?.id && existingMeta.id !== id) {
+        if (existingMeta?.rolloutId && existingMeta.rolloutId !== rolloutId) {
           const extension = path.extname(destination);
-          destination = `${destination.slice(0, -extension.length)}-${id}${extension}`;
+          destination = `${destination.slice(0, -extension.length)}-${rolloutId}${extension}`;
         }
       }
       const targetProvider = homeProviders.get(home.name);
@@ -953,7 +987,7 @@ async function synchronizeFiles(config) {
   const archiveDatabaseUpdates = {};
   let archiveDatabaseConsistent = true;
   if (!archiveState.disabled) {
-    const reconciledCandidates = await collectAllCandidates(config);
+    const reconciledCandidates = groupCandidatesByThread(await collectAllCandidates(config));
     for (const home of config.homes) archiveDatabaseUpdates[home.name] = await synchronizeArchiveDatabase(home, archiveState.archivedById, reconciledCandidates);
     archiveDatabaseConsistent = await archiveStatesMatchDatabases(config, archiveState.archivedById);
     if (archiveDatabaseConsistent) {
@@ -962,7 +996,7 @@ async function synchronizeFiles(config) {
       await writeArchiveSnapshots(config, reconciledObservations);
     }
   }
-  return { sessions: grouped.size, copiedToCanonical, copiedToHomes, conflicts, archiveMoves, archiveEventsWritten: archiveState.eventsWritten, archiveDatabaseUpdates, archiveDatabaseConsistent };
+  return { sessions: candidatesByThread.size, rollouts: grouped.size, copiedToCanonical, copiedToHomes, conflicts, archiveMoves, archiveEventsWritten: archiveState.eventsWritten, archiveDatabaseUpdates, archiveDatabaseConsistent };
 }
 
 async function refreshProvider(config, home) {
