@@ -1,0 +1,2 @@
+#!/bin/sh
+CODEX_HISTORY_SYNC_GIT_HOOK=1 "$(command -v node)" "$(git rev-parse --show-toplevel)/bin/sync-history.mjs" pull --no-pull --no-commit >/dev/null 2>&1 || true

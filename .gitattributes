@@ -1,0 +1,5 @@
+*.example.json text eol=lf
+*.mjs text eol=lf
+*.ps1 text eol=crlf
+*.json text eol=lf
+.githooks/* text eol=lf

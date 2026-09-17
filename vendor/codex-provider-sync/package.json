@@ -1,0 +1,50 @@
+{
+  "name": "@dailin521/codex-provider-sync",
+  "version": "1.0.3",
+  "description": "Synchronize Codex session provider metadata across rollout files and SQLite state.",
+  "type": "module",
+  "workspaces": [],
+  "files": [
+    "README.md",
+    "LICENSE",
+    "packages/contracts/dist",
+    "packages/core/src",
+    "src"
+  ],
+  "bin": {
+    "codex-provider": "src/cli.js"
+  },
+  "scripts": {},
+  "engines": {
+    "node": ">=16.20.2"
+  },
+  "keywords": [
+    "codex",
+    "sqlite",
+    "sessions",
+    "provider"
+  ],
+  "author": "Dailin521",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dailin521/codex-provider-sync.git"
+  },
+  "homepage": "https://github.com/Dailin521/codex-provider-sync#readme",
+  "bugs": {
+    "url": "https://github.com/Dailin521/codex-provider-sync/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "8.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "ajv": "8.20.0"
+  },
+  "overrides": {
+    "node-releases": "2.0.18"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "homes": [
+    {
+      "name": "official-codex",
+      "path": "~/.codex",
+      "installHooks": true
+    },
+    {
+      "name": "custom-codex",
+      "path": "~/.customcodex",
+      "installHooks": true
+    }
+  ],
+  "git": {
+    "dataRepository": "D:/Private/codex-history-data",
+    "remote": "origin",
+    "branch": "main",
+    "autoPull": true,
+    "autoPush": true,
+    "commitDebounceSeconds": 20
+  },
+  "providerSync": {
+    "enabled": true,
+    "entry": "vendor/codex-provider-sync/src/cli.js",
+    "onMissing": "warn"
+  },
+  "sync": {
+    "includeArchived": true,
+    "includeSessionIndex": true,
+    "propagateDeletes": false,
+    "refreshThreadIndex": true,
+    "indexRefreshTimeoutSeconds": 120,
+    "includeUiMetadata": true,
+    "settleMilliseconds": 1500,
+    "lockStaleMinutes": 30
+  }
+}

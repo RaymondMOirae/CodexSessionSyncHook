@@ -1,0 +1,19 @@
+{
+  "name": "codex-history-sync",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Configurable Git-backed bidirectional synchronization for multiple Codex homes.",
+  "bin": {
+    "codex-history-sync": "bin/cli.mjs"
+  },
+  "scripts": {
+    "init": "node bin/cli.mjs init",
+    "install-hooks": "node bin/cli.mjs install-hooks",
+    "sync": "node bin/cli.mjs sync",
+    "doctor": "node bin/cli.mjs doctor"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}

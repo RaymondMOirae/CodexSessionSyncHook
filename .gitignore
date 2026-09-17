@@ -1,0 +1,15 @@
+.sync/
+.codex-sync/
+logs/
+conflicts/
+data/
+sync.config.json
+node_modules/
+*.tmp
+*.lock
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+**/auth.json
+**/config.toml
+data/**/.DS_Store

@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+blocked='(^|/)(auth\.json|config\.toml|.*\.sqlite(-wal|-shm)?|\.codex-global-state\.json)$'
+if git diff --cached --name-only | grep -E "$blocked" >/dev/null 2>&1; then
+  echo "Refusing commit: credential, config, or live SQLite files are staged." >&2
+  exit 1
+fi
+
+if git diff --cached --name-only | grep -E '(^|/)(logs?|cache|tmp|thread-writer-locks)/' >/dev/null 2>&1; then
+  echo "Refusing commit: runtime logs, caches, temp files, or locks are staged." >&2
+  exit 1
+fi
