@@ -18,6 +18,24 @@ function rootsKey(roots) {
   return [...roots].map(normalizeRoot).filter(Boolean).sort().join("|");
 }
 
+function homeStateKey(home) {
+  return crypto.createHash("sha256").update(`${home.name}\0${home.path}`).digest("hex").slice(0, 16);
+}
+
+function projectObservationPath(dataRepoRoot, home) {
+  return path.join(dataRepoRoot, ".sync", "project-observations", `${home.name.replace(/[^A-Za-z0-9._-]/g, "_")}-${homeStateKey(home)}.json`);
+}
+
+async function metadataDeviceId(dataRepoRoot) {
+  const deviceIdPath = path.join(dataRepoRoot, ".sync", "device-id");
+  const current = (await fsp.readFile(deviceIdPath, "utf8").catch(() => "")).trim();
+  if (current) return current;
+  const created = crypto.randomUUID();
+  await fsp.mkdir(path.dirname(deviceIdPath), { recursive: true });
+  await fsp.writeFile(deviceIdPath, `${created}\n`, { encoding: "utf8", flag: "wx" }).catch(() => {});
+  return (await fsp.readFile(deviceIdPath, "utf8").catch(() => created)).trim() || created;
+}
+
 async function exists(filePath) {
   try { await fsp.access(filePath); return true; } catch { return false; }
 }
@@ -67,30 +85,40 @@ function addProject(projects, source) {
 }
 
 function readHomeMetadata(home, projects, names) {
+  const observation = { presentKeys: new Set(), deletedHints: new Map(), available: false };
   const globalStatePath = path.join(home.path, ".codex-global-state.json");
+  let state = {};
   if (fs.existsSync(globalStatePath)) {
+    observation.available = true;
     try {
-      const state = JSON.parse(fs.readFileSync(globalStatePath, "utf8"));
-      const localProjects = state["local-projects"] ?? {};
-      const assignments = state["thread-project-assignments"] ?? {};
-      for (const [legacyId, value] of Object.entries(localProjects)) {
-        const threadIds = Object.entries(assignments)
-          .filter(([, assignment]) => assignment?.projectId === legacyId)
-          .map(([threadId]) => threadId);
-        addProject(projects, {
-          id: legacyId,
-          name: value.name,
-          roots: value.rootPaths,
-          threadIds,
-          createdAt: value.createdAt,
-          updatedAt: value.updatedAt
-        });
-      }
+      state = JSON.parse(fs.readFileSync(globalStatePath, "utf8"));
     } catch {}
   }
   readSessionNames(path.join(home.path, "session_index.jsonl"), names);
   const dbPath = stateDbPath(home.path);
-  if (!dbPath) return;
+  if (dbPath) observation.available = true;
+  const localProjects = state["local-projects"] ?? {};
+  const assignments = state["thread-project-assignments"] ?? {};
+  const hostKey = `local:${home.path.replaceAll("/", "\\")}`;
+  const projectMappings = state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {};
+  const migration = state["app-server-projects-migration-by-host"]?.[hostKey];
+  if (!dbPath) {
+    for (const [legacyId, value] of Object.entries(localProjects)) {
+      const threadIds = Object.entries(assignments)
+        .filter(([, assignment]) => assignment?.projectId === legacyId)
+        .map(([threadId]) => threadId);
+      const project = addProject(projects, {
+        id: legacyId,
+        name: value.name,
+        roots: value.rootPaths,
+        threadIds,
+        createdAt: value.createdAt,
+        updatedAt: value.updatedAt
+      });
+      observation.presentKeys.add(rootsKey(project.roots));
+    }
+    return observation;
+  }
   try {
     const db = new DatabaseSync(dbPath, { readOnly: true });
     const projectRows = db.prepare("SELECT id, name, created_at_ms, updated_at_ms FROM projects ORDER BY position").all();
@@ -101,27 +129,156 @@ function readHomeMetadata(home, projects, names) {
       list.push(row.path);
       rootsById.set(row.project_id, list);
     }
+    const dbProjectIds = new Set(projectRows.map((row) => row.id));
+    const legacyByAppId = new Map(Object.entries(projectMappings).map(([legacyId, appProjectId]) => [appProjectId, legacyId]));
+    const legacyByRoots = new Map(Object.entries(localProjects).map(([legacyId, value]) => [rootsKey(value.rootPaths ?? []), legacyId]));
     for (const row of projectRows) {
+      const roots = rootsById.get(row.id) ?? [];
+      const legacyId = legacyByAppId.get(row.id) ?? legacyByRoots.get(rootsKey(roots));
+      const legacy = legacyId ? localProjects[legacyId] : null;
       const threadIds = db.prepare("SELECT id FROM threads WHERE project_id = ?").all(row.id).map((entry) => entry.id);
-      addProject(projects, {
-        id: row.id,
-        name: row.name,
-        roots: rootsById.get(row.id) ?? [],
+      const project = addProject(projects, {
+        id: legacyId ?? row.id,
+        name: row.name || legacy?.name,
+        roots,
         threadIds,
-        createdAt: row.created_at_ms,
-        updatedAt: row.updated_at_ms
+        createdAt: legacy?.createdAt ?? row.created_at_ms,
+        updatedAt: Math.max(legacy?.updatedAt ?? 0, row.updated_at_ms ?? 0)
       });
+      observation.presentKeys.add(rootsKey(project.roots));
+    }
+    if (migration?.projectsMigrated === true) {
+      for (const [legacyId, value] of Object.entries(localProjects)) {
+        const appProjectId = projectMappings[legacyId];
+        if (!appProjectId || dbProjectIds.has(appProjectId)) continue;
+        const roots = Array.isArray(value.rootPaths) ? value.rootPaths.map(String).filter(Boolean) : [];
+        const key = rootsKey(roots) || `id:${legacyId}`;
+        observation.deletedHints.set(key, { id: legacyId, name: value.name, roots });
+      }
     }
     for (const row of db.prepare("SELECT id, name FROM threads WHERE name IS NOT NULL AND length(name) > 0").all()) {
       if (!names.has(row.id)) names.set(row.id, { name: row.name, updatedAt: 0 });
     }
     db.close();
   } catch {}
+  return observation;
+}
+
+function newerProjectEvent(current, candidate) {
+  if (!current) return candidate;
+  if (candidate.observedAtMs !== current.observedAtMs) return candidate.observedAtMs > current.observedAtMs ? candidate : current;
+  if (candidate.deleted !== current.deleted) return candidate.deleted ? candidate : current;
+  return String(candidate.source).localeCompare(String(current.source)) > 0 ? candidate : current;
+}
+
+async function loadProjectEvents(dataRepoRoot) {
+  const latest = new Map();
+  const root = path.join(dataRepoRoot, "data", "project-events");
+  if (!(await exists(root))) return latest;
+  const pending = [root];
+  while (pending.length) {
+    const current = pending.pop();
+    for (const entry of await fsp.readdir(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(full);
+      else if (entry.isFile() && entry.name.endsWith(".json")) {
+        let event;
+        try { event = JSON.parse(await fsp.readFile(full, "utf8")); } catch { continue; }
+        if (typeof event?.key !== "string" || typeof event?.deleted !== "boolean") continue;
+        const observedAtMs = Number(event.observedAtMs) || Date.parse(event.observedAt ?? "") || 0;
+        const normalized = { ...event, observedAtMs, source: event.source ?? "unknown" };
+        latest.set(event.key, newerProjectEvent(latest.get(event.key), normalized));
+      }
+    }
+  }
+  return latest;
+}
+
+async function appendProjectEvent(dataRepoRoot, event) {
+  const eventRoot = path.join(dataRepoRoot, "data", "project-events", crypto.createHash("sha256").update(event.key).digest("hex"));
+  await fsp.mkdir(eventRoot, { recursive: true });
+  const fileName = `${String(event.observedAtMs).padStart(13, "0")}-${event.source.replace(/[^A-Za-z0-9._-]/g, "_")}-${crypto.randomUUID()}.json`;
+  await fsp.writeFile(path.join(eventRoot, fileName), `${JSON.stringify(event, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+}
+
+async function loadDeletedThreadIds(dataRepoRoot) {
+  const deleted = new Set();
+  const root = path.join(dataRepoRoot, "data", "delete-events");
+  if (!(await exists(root))) return deleted;
+  const pending = [root];
+  while (pending.length) {
+    const current = pending.pop();
+    for (const entry of await fsp.readdir(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(full);
+      else if (entry.isFile() && entry.name.endsWith(".json")) {
+        let event;
+        try { event = JSON.parse(await fsp.readFile(full, "utf8")); } catch { continue; }
+        if (typeof event?.id === "string" && event.deleted === true) deleted.add(event.id);
+      }
+    }
+  }
+  return deleted;
+}
+
+async function resolveProjectEvents(config, dataRepoRoot, observations, previousProjects) {
+  const latest = await loadProjectEvents(dataRepoRoot);
+  if (config.sync.propagateDeletes !== true) return latest;
+  const deviceId = await metadataDeviceId(dataRepoRoot);
+  const snapshots = new Map();
+  for (const home of config.homes) {
+    let snapshot = { states: {} };
+    try { snapshot = JSON.parse(await fsp.readFile(projectObservationPath(dataRepoRoot, home), "utf8")); } catch {}
+    snapshots.set(home.name, snapshot.states ?? {});
+  }
+  const keys = new Set([
+    ...latest.keys(),
+    ...previousProjects.map((project) => rootsKey(project.roots ?? []) || `id:${project.id}`),
+    ...[...observations.values()].flatMap((observation) => [...observation.presentKeys, ...observation.deletedHints.keys()]),
+    ...[...snapshots.values()].flatMap((states) => Object.keys(states))
+  ]);
+  for (const key of keys) {
+    const changes = [];
+    let descriptor = null;
+    for (const home of config.homes) {
+      const observation = observations.get(home.name) ?? { presentKeys: new Set(), deletedHints: new Map() };
+      if (observation.available === false) continue;
+      const hint = observation.deletedHints.get(key);
+      if (hint) {
+        descriptor ??= hint;
+        if (latest.get(key)?.deleted !== true) changes.push({ home: home.name, deleted: true, reason: "deleted-mapping" });
+        continue;
+      }
+      const prior = snapshots.get(home.name)?.[key];
+      const present = observation.presentKeys.has(key);
+      if (typeof prior === "boolean" && prior !== present && latest.get(key)?.deleted !== !present) {
+        changes.push({ home: home.name, deleted: !present, reason: "presence-transition" });
+      }
+    }
+    if (changes.length === 0) continue;
+    const deleted = changes.some((entry) => entry.deleted);
+    const observedAtMs = Math.max(Date.now(), (latest.get(key)?.observedAtMs ?? 0) + 1);
+    const event = {
+      schemaVersion: 1,
+      key,
+      id: descriptor?.id ?? latest.get(key)?.id ?? null,
+      name: descriptor?.name ?? latest.get(key)?.name ?? null,
+      roots: descriptor?.roots ?? latest.get(key)?.roots ?? key.split("|").filter((entry) => !entry.startsWith("id:")),
+      deleted,
+      observedAt: new Date(observedAtMs).toISOString(),
+      observedAtMs,
+      source: `${deviceId}:${changes.map((entry) => entry.home).sort().join(",")}${deleted && changes.some((entry) => !entry.deleted) ? ":delete-wins" : ""}`
+    };
+    await appendProjectEvent(dataRepoRoot, event);
+    latest.set(key, event);
+  }
+  return latest;
 }
 
 export async function collectUiMetadata(config, dataRepoRoot) {
   const projects = new Map();
   const names = new Map();
+  const observations = new Map();
   const metadataPath = path.join(dataRepoRoot, "data", "ui-metadata.json");
   let previous = { projects: [], threadNames: {} };
   try {
@@ -131,19 +288,21 @@ export async function collectUiMetadata(config, dataRepoRoot) {
       if (typeof name === "string" && name.trim()) names.set(threadId, { name, updatedAt: 0 });
     }
   } catch {}
-  for (const home of config.homes) readHomeMetadata(home, projects, names);
+  for (const home of config.homes) observations.set(home.name, readHomeMetadata(home, projects, names));
+  const projectEvents = await resolveProjectEvents(config, dataRepoRoot, observations, previous.projects ?? []);
+  const deletedThreadIds = config.sync.propagateDeletes === true ? await loadDeletedThreadIds(dataRepoRoot) : new Set();
   readSessionNames(path.join(dataRepoRoot, "data", "session_index.jsonl"), names);
   const content = {
     schemaVersion: 1,
-    projects: [...projects.values()].map((project) => ({
+    projects: [...projects.entries()].filter(([key]) => projectEvents.get(key)?.deleted !== true).map(([, project]) => ({
       id: project.id,
       name: project.name,
       roots: [...project.roots],
-      threadIds: [...project.threadIds],
+      threadIds: [...project.threadIds].filter((threadId) => !deletedThreadIds.has(threadId)),
       createdAt: project.createdAt,
       updatedAt: project.updatedAt
     })),
-    threadNames: Object.fromEntries([...names].map(([threadId, value]) => [threadId, value.name]))
+    threadNames: Object.fromEntries([...names].filter(([threadId]) => !deletedThreadIds.has(threadId)).map(([threadId, value]) => [threadId, value.name]))
   };
   const comparablePrevious = { schemaVersion: previous.schemaVersion, projects: previous.projects ?? [], threadNames: previous.threadNames ?? {} };
   const changed = JSON.stringify(content) !== JSON.stringify(comparablePrevious);
@@ -221,7 +380,7 @@ async function listAllThreads(client) {
     let cursor = null;
     do {
       const page = await client.call("thread/list", { limit: 100, archived, useStateDbOnly: false, ...(cursor ? { cursor } : {}) });
-      threads.push(...(page.data ?? []));
+      threads.push(...(page.data ?? []).map((thread) => ({ ...thread, __syncArchived: archived })));
       cursor = page.nextCursor ?? null;
     } while (cursor);
   }
@@ -245,12 +404,17 @@ export async function applyUiMetadata(config, home, metadata) {
   if (config.sync.includeUiMetadata === false) return { skipped: true, reason: "disabled" };
   const executable = await discoverCodexExecutable(home.path);
   if (!executable) return { skipped: true, reason: "codex-cli-not-found" };
+  const dbPath = stateDbPath(home.path);
+  const globalStatePath = path.join(home.path, ".codex-global-state.json");
   const timeoutMs = Math.max(10, Number(config.sync.indexRefreshTimeoutSeconds ?? 120)) * 1000;
   const client = createRpcClient(executable, home.path, timeoutMs);
   const appProjectByCanonicalId = new Map();
   let threadCount = 0;
   let projectAssignments = 0;
+  let projectDeletes = 0;
   let nameUpdates = 0;
+  let backupDir = null;
+  const newlyProjectlessThreadIds = new Set();
   try {
     await client.call("initialize", {
       clientInfo: { name: "codex_history_sync", title: "Codex History Sync", version: "1.0.0" },
@@ -263,6 +427,20 @@ export async function applyUiMetadata(config, home, metadata) {
     const projectPage = await client.call("project/list", { limit: 100 });
     const existingProjects = projectPage.data ?? [];
     const existingByRoots = new Map(existingProjects.map((project) => [rootsKey(project.roots?.map((root) => root.path) ?? []), project]));
+    const desiredProjectKeys = new Set((metadata.projects ?? []).map((project) => rootsKey(project.roots ?? [])));
+    if (config.sync.propagateDeletes === true) {
+      for (const existing of existingProjects) {
+        const key = rootsKey(existing.roots?.map((root) => root.path) ?? []);
+        if (desiredProjectKeys.has(key)) continue;
+        if (!backupDir) backupDir = await backupMetadata(home.path, dbPath);
+        for (const thread of threadById.values()) {
+          if (thread.projectId === existing.id && !thread.__syncArchived) newlyProjectlessThreadIds.add(thread.id);
+        }
+        await client.call("project/delete", { projectId: existing.id });
+        existingByRoots.delete(key);
+        projectDeletes += 1;
+      }
+    }
     for (const project of metadata.projects ?? []) {
       const key = rootsKey(project.roots ?? []);
       let target = existingByRoots.get(key);
@@ -299,8 +477,6 @@ export async function applyUiMetadata(config, home, metadata) {
     client.child.kill();
   }
 
-  const dbPath = stateDbPath(home.path);
-  const globalStatePath = path.join(home.path, ".codex-global-state.json");
   let dbNeedsUpdate = false;
   let dbUpdates = { names: 0, projects: 0 };
   if (dbPath) {
@@ -328,9 +504,13 @@ export async function applyUiMetadata(config, home, metadata) {
   let state = {};
   try { state = JSON.parse(await fsp.readFile(globalStatePath, "utf8")); } catch {}
   const originalStateText = JSON.stringify(state);
-  const localProjects = { ...(state["local-projects"] ?? {}) };
-  const assignments = { ...(state["thread-project-assignments"] ?? {}) };
-  const projectOrder = [...(state["project-order"] ?? [])];
+  const previousAssignments = state["thread-project-assignments"] ?? {};
+  const localProjects = config.sync.propagateDeletes === true ? {} : { ...(state["local-projects"] ?? {}) };
+  const assignments = config.sync.propagateDeletes === true
+    ? Object.fromEntries(Object.entries(previousAssignments).filter(([, assignment]) => assignment?.projectKind !== "local"))
+    : { ...previousAssignments };
+  const previousProjectOrder = [...(state["project-order"] ?? [])];
+  const projectOrder = config.sync.propagateDeletes === true ? [] : [...previousProjectOrder];
   for (const project of metadata.projects ?? []) {
     localProjects[project.id] = {
       id: project.id,
@@ -344,10 +524,18 @@ export async function applyUiMetadata(config, home, metadata) {
   }
   state["local-projects"] = localProjects;
   state["thread-project-assignments"] = assignments;
-  state["project-order"] = projectOrder.filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
-  state["projectless-thread-ids"] = (state["projectless-thread-ids"] ?? []).filter((threadId) => !assignments[threadId]);
+  const desiredOrder = [
+    ...previousProjectOrder.filter((id) => localProjects[id]),
+    ...projectOrder
+  ].filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
+  state["project-order"] = desiredOrder;
+  const projectless = new Set((state["projectless-thread-ids"] ?? []).filter((threadId) => !assignments[threadId]));
+  for (const threadId of newlyProjectlessThreadIds) if (!assignments[threadId]) projectless.add(threadId);
+  state["projectless-thread-ids"] = [...projectless];
   const hostKey = `local:${home.path.replaceAll("/", "\\")}`;
-  const projectMappings = { ...(state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {}) };
+  const projectMappings = config.sync.propagateDeletes === true
+    ? {}
+    : { ...(state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {}) };
   for (const [canonicalId, appProjectId] of appProjectByCanonicalId) projectMappings[canonicalId] = appProjectId;
   state["app-server-project-id-by-legacy-project-id-by-host"] = {
     ...(state["app-server-project-id-by-legacy-project-id-by-host"] ?? {}),
@@ -359,10 +547,9 @@ export async function applyUiMetadata(config, home, metadata) {
   };
   const desiredStateText = JSON.stringify(state);
   const stateNeedsUpdate = desiredStateText !== originalStateText;
-  let backupDir = null;
   if (dbNeedsUpdate || stateNeedsUpdate) {
     try {
-      backupDir = await backupMetadata(home.path, dbPath, { includeDatabase: dbNeedsUpdate, includeGlobalState: stateNeedsUpdate });
+      backupDir ??= await backupMetadata(home.path, dbPath, { includeDatabase: dbNeedsUpdate, includeGlobalState: stateNeedsUpdate });
     } catch (error) {
       return {
         ok: false,
@@ -370,6 +557,7 @@ export async function applyUiMetadata(config, home, metadata) {
         reason: "backup-failed",
         error: error.message,
         projects: appProjectByCanonicalId.size,
+        projectDeletes,
         projectAssignments,
         nameUpdates,
         threadCount
@@ -394,7 +582,7 @@ export async function applyUiMetadata(config, home, metadata) {
           db.exec("COMMIT");
         } catch (error) {
           db.exec("ROLLBACK");
-          return { ok: false, partial: true, reason: "database-busy-or-write-failed", error: error.message, projects: appProjectByCanonicalId.size, projectAssignments, nameUpdates, threadCount, backupDir };
+          return { ok: false, partial: true, reason: "database-busy-or-write-failed", error: error.message, projects: appProjectByCanonicalId.size, projectDeletes, projectAssignments, nameUpdates, threadCount, backupDir };
         }
       } finally {
         db.close();
@@ -409,6 +597,7 @@ export async function applyUiMetadata(config, home, metadata) {
   return {
     ok: true,
     projects: appProjectByCanonicalId.size,
+    projectDeletes,
     projectAssignments,
     nameUpdates,
     threadCount,
@@ -425,11 +614,17 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
   let state = {};
   try { state = JSON.parse(await fsp.readFile(globalStatePath, "utf8")); } catch {}
 
-  const localProjects = { ...(state["local-projects"] ?? {}) };
-  const assignments = { ...(state["thread-project-assignments"] ?? {}) };
-  const projectOrder = [...(state["project-order"] ?? [])];
+  const previousAssignments = state["thread-project-assignments"] ?? {};
+  const localProjects = config.sync.propagateDeletes === true ? {} : { ...(state["local-projects"] ?? {}) };
+  const assignments = config.sync.propagateDeletes === true
+    ? Object.fromEntries(Object.entries(previousAssignments).filter(([, assignment]) => assignment?.projectKind !== "local"))
+    : { ...previousAssignments };
+  const previousProjectOrder = [...(state["project-order"] ?? [])];
+  const projectOrder = config.sync.propagateDeletes === true ? [] : [...previousProjectOrder];
   const hostKey = `local:${home.path.replaceAll("/", "\\")}`;
-  const projectMappings = { ...(state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {}) };
+  const projectMappings = config.sync.propagateDeletes === true
+    ? {}
+    : { ...(state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {}) };
   const dbPath = stateDbPath(home.path);
   const projectsByRoots = new Map();
 
@@ -466,7 +661,10 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
 
   state["local-projects"] = localProjects;
   state["thread-project-assignments"] = assignments;
-  state["project-order"] = projectOrder.filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
+  state["project-order"] = [
+    ...previousProjectOrder.filter((id) => localProjects[id]),
+    ...projectOrder
+  ].filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
   state["projectless-thread-ids"] = (state["projectless-thread-ids"] ?? []).filter((threadId) => !assignments[threadId]);
   state["app-server-project-id-by-legacy-project-id-by-host"] = {
     ...(state["app-server-project-id-by-legacy-project-id-by-host"] ?? {}),
@@ -491,4 +689,30 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
     mappings: Object.keys(projectMappings).length,
     backupStateUpdated: writeBackupState
   };
+}
+
+export async function writeUiMetadataObservations(config, dataRepoRoot, metadata) {
+  const events = await loadProjectEvents(dataRepoRoot);
+  const knownKeys = new Set([
+    ...events.keys(),
+    ...(metadata.projects ?? []).map((project) => rootsKey(project.roots ?? []) || `id:${project.id}`)
+  ]);
+  const observations = new Map();
+  for (const home of config.homes) {
+    const observation = readHomeMetadata(home, new Map(), new Map());
+    observations.set(home.name, observation);
+    for (const key of observation.presentKeys) knownKeys.add(key);
+    for (const key of observation.deletedHints.keys()) knownKeys.add(key);
+  }
+  for (const home of config.homes) {
+    const observation = observations.get(home.name);
+    if (observation.available === false) continue;
+    const snapshotPath = projectObservationPath(dataRepoRoot, home);
+    await fsp.mkdir(path.dirname(snapshotPath), { recursive: true });
+    await fsp.writeFile(snapshotPath, `${JSON.stringify({
+      schemaVersion: 1,
+      observedAt: new Date().toISOString(),
+      states: Object.fromEntries([...knownKeys].map((key) => [key, observation.presentKeys.has(key)]))
+    }, null, 2)}\n`, "utf8");
+  }
 }

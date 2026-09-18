@@ -8,7 +8,7 @@ import readline from "node:readline";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
-import { applyUiMetadata, collectUiMetadata } from "./ui-metadata.mjs";
+import { applyUiMetadata, collectUiMetadata, writeUiMetadataObservations } from "./ui-metadata.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -333,6 +333,120 @@ async function discoverCodexExecutable(homePath) {
   return null;
 }
 
+function createAppServerClient(executable, homePath, timeoutMs) {
+  const child = spawn(executable, ["app-server"], {
+    cwd: repoRoot,
+    windowsHide: true,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, CODEX_HOME: homePath }
+  });
+  let buffer = "";
+  let sequence = 0;
+  const pending = new Map();
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk.toString();
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try { message = JSON.parse(line); } catch { continue; }
+      const request = pending.get(message.id);
+      if (!request) continue;
+      pending.delete(message.id);
+      clearTimeout(request.timer);
+      if (message.error) request.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
+      else request.resolve(message.result);
+    }
+  });
+  child.on("exit", (code) => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(new Error(`app-server exited with code ${code}`));
+    }
+    pending.clear();
+  });
+  const call = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = ++sequence;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`${method} timed out`));
+    }, timeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    child.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
+  });
+  const notify = (method, params = {}) => child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  return { child, call, notify };
+}
+
+async function deleteThreadsFromHome(config, home, threadIds) {
+  const results = new Map();
+  if (threadIds.length === 0) return results;
+  const executable = await discoverCodexExecutable(home.path);
+  if (!executable) {
+    for (const id of threadIds) results.set(id, { ok: false, reason: "codex-cli-not-found" });
+    return results;
+  }
+  const timeoutMs = Math.max(10, Number(config.sync.indexRefreshTimeoutSeconds ?? 120)) * 1000;
+  const client = createAppServerClient(executable, home.path, timeoutMs);
+  try {
+    await client.call("initialize", {
+      clientInfo: { name: "codex_history_sync", title: "Codex History Sync", version: "1.0.0" },
+      capabilities: { experimentalApi: true }
+    });
+    client.notify("initialized", {});
+    for (const threadId of threadIds) {
+      try {
+        await client.call("thread/delete", { threadId });
+        results.set(threadId, { ok: true });
+      } catch (error) {
+        results.set(threadId, { ok: false, reason: error.message });
+      }
+    }
+  } catch (error) {
+    for (const id of threadIds) if (!results.has(id)) results.set(id, { ok: false, reason: error.message });
+  } finally {
+    client.child.kill();
+  }
+  return results;
+}
+
+async function applyThreadDeletions(config, deleteState, candidatesById, locked) {
+  const eligible = [...deleteState.deletedIds].filter((id) => !locked.has(id));
+  const resultsByHome = new Map();
+  for (const home of config.homes) {
+    const observed = deleteState.observations.get(home.name) ?? new Map();
+    const ids = eligible.filter((id) => observed.has(id));
+    resultsByHome.set(home.name, await deleteThreadsFromHome(config, home, ids));
+  }
+  const appliedIds = new Set();
+  const deferredIds = new Set([...deleteState.deletedIds].filter((id) => locked.has(id)));
+  for (const id of eligible) {
+    let succeeded = true;
+    for (const home of config.homes) {
+      const observed = deleteState.observations.get(home.name) ?? new Map();
+      if (!observed.has(id)) continue;
+      const result = resultsByHome.get(home.name)?.get(id);
+      if (!result?.ok) {
+        succeeded = false;
+        await log(`delete deferred ${id} for ${home.name}: ${result?.reason ?? "unknown error"}`);
+      }
+    }
+    if (!succeeded) {
+      deferredIds.add(id);
+      continue;
+    }
+    for (const candidate of candidatesById.get(id) ?? []) {
+      for (const filePath of candidate.allPaths ?? [candidate.filePath]) await fsp.rm(filePath, { force: true });
+    }
+    appliedIds.add(id);
+  }
+  return { appliedIds, deferredIds, resultsByHome };
+}
+
 async function refreshThreadIndex(config, home) {
   if (config.sync.refreshThreadIndex === false) return { skipped: true, reason: "disabled" };
   const executable = await discoverCodexExecutable(home.path);
@@ -586,6 +700,114 @@ async function appendArchiveEvent(event) {
   await fsp.mkdir(root, { recursive: true });
   const fileName = `${String(event.observedAtMs).padStart(13, "0")}-${event.source.replace(/[^A-Za-z0-9._-]/g, "_")}-${crypto.randomUUID()}.json`;
   await fsp.writeFile(path.join(root, fileName), `${JSON.stringify(event, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+}
+
+function observedThreadPresence(candidatesById, sourceName) {
+  const states = new Map();
+  for (const [id, candidates] of candidatesById) {
+    if (candidates.some((candidate) => candidate.sourceName === sourceName)) states.set(id, true);
+  }
+  return states;
+}
+
+function threadPresenceObservationPath(home) {
+  const key = crypto.createHash("sha256").update(`${home.name}\0${home.path}`).digest("hex").slice(0, 16);
+  return path.join(stateDir, "thread-presence-observations", `${home.name.replace(/[^A-Za-z0-9._-]/g, "_")}-${key}.json`);
+}
+
+async function homeThreadInventoryAvailable(home) {
+  return await exists(path.join(home.path, "state_5.sqlite"))
+    || await exists(path.join(home.path, "sqlite", "state_5.sqlite"))
+    || await exists(path.join(home.path, "sessions"))
+    || await exists(path.join(home.path, "archived_sessions"));
+}
+
+function newerDeleteEvent(current, candidate) {
+  if (!current) return candidate;
+  if (candidate.observedAtMs !== current.observedAtMs) return candidate.observedAtMs > current.observedAtMs ? candidate : current;
+  return String(candidate.source).localeCompare(String(current.source)) > 0 ? candidate : current;
+}
+
+async function loadDeleteEvents() {
+  const root = path.join(dataRepoRoot, "data", "delete-events");
+  const latest = new Map();
+  for (const filePath of await walkFiles(root, ".json")) {
+    const event = await readJson(filePath, null);
+    if (typeof event?.id !== "string" || event?.deleted !== true) continue;
+    const observedAtMs = Number(event.observedAtMs) || Date.parse(event.observedAt ?? "") || 0;
+    const normalized = { id: event.id, deleted: true, observedAtMs, source: event.source ?? "unknown" };
+    latest.set(event.id, newerDeleteEvent(latest.get(event.id), normalized));
+  }
+  return latest;
+}
+
+async function appendDeleteEvent(event) {
+  const safeId = event.id.replace(/[^A-Za-z0-9._-]/g, "_");
+  const root = path.join(dataRepoRoot, "data", "delete-events", safeId);
+  await fsp.mkdir(root, { recursive: true });
+  const fileName = `${String(event.observedAtMs).padStart(13, "0")}-${event.source.replace(/[^A-Za-z0-9._-]/g, "_")}-${crypto.randomUUID()}.json`;
+  await fsp.writeFile(path.join(root, fileName), `${JSON.stringify(event, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+}
+
+async function resolveDeleteStates(config, candidatesById) {
+  if (config.sync.propagateDeletes !== true) {
+    return { deletedIds: new Set(), observations: new Map(), eventsWritten: 0, disabled: true };
+  }
+  const deviceId = await archiveDeviceId();
+  const latestEvents = await loadDeleteEvents();
+  const observations = new Map();
+  const snapshots = new Map();
+  const availableHomes = new Set();
+  for (const home of config.homes) {
+    observations.set(home.name, observedThreadPresence(candidatesById, home.name));
+    snapshots.set(home.name, (await readJson(threadPresenceObservationPath(home), { states: {} })).states ?? {});
+    if (await homeThreadInventoryAvailable(home)) availableHomes.add(home.name);
+  }
+  const ids = new Set([
+    ...candidatesById.keys(),
+    ...latestEvents.keys(),
+    ...[...snapshots.values()].flatMap((states) => Object.keys(states))
+  ]);
+  let eventsWritten = 0;
+  for (const id of ids) {
+    if (latestEvents.has(id)) continue;
+    const deletedBy = [];
+    for (const home of config.homes) {
+      if (!availableHomes.has(home.name)) continue;
+      const prior = snapshots.get(home.name)?.[id];
+      const present = observations.get(home.name).has(id);
+      if (prior === true && !present) deletedBy.push(home.name);
+    }
+    if (deletedBy.length === 0) continue;
+    const observedAtMs = Date.now();
+    const event = {
+      schemaVersion: 1,
+      id,
+      deleted: true,
+      observedAt: new Date(observedAtMs).toISOString(),
+      observedAtMs,
+      source: `${deviceId}:${deletedBy.sort().join(",")}`
+    };
+    await appendDeleteEvent(event);
+    latestEvents.set(id, event);
+    eventsWritten += 1;
+  }
+  return { deletedIds: new Set(latestEvents.keys()), observations, availableHomes, eventsWritten, disabled: false };
+}
+
+async function writeThreadPresenceSnapshots(config, candidatesById, deletedIds) {
+  const knownIds = new Set([...candidatesById.keys(), ...deletedIds]);
+  for (const home of config.homes) {
+    if (!(await homeThreadInventoryAvailable(home))) continue;
+    const observed = observedThreadPresence(candidatesById, home.name);
+    const snapshotPath = threadPresenceObservationPath(home);
+    await fsp.mkdir(path.dirname(snapshotPath), { recursive: true });
+    await fsp.writeFile(snapshotPath, `${JSON.stringify({
+      schemaVersion: 1,
+      observedAt: timestamp(),
+      states: Object.fromEntries([...knownIds].map((id) => [id, observed.has(id)]))
+    }, null, 2)}\n`, "utf8");
+  }
 }
 
 async function resolveArchiveStates(config, candidatesById) {
@@ -882,7 +1104,7 @@ async function selectWinner(id, candidates, stripEncryptedContent = true) {
   return null;
 }
 
-async function mergeSessionIndex(config) {
+async function mergeSessionIndex(config, deletedIds = new Set()) {
   if (!config.sync.includeSessionIndex) return;
   const files = [path.join(dataRepoRoot, "data", "session_index.jsonl"), ...config.homes.map((home) => path.join(home.path, "session_index.jsonl"))];
   const latest = new Map();
@@ -894,6 +1116,7 @@ async function mergeSessionIndex(config) {
       try {
         const entry = JSON.parse(line);
         if (typeof entry.id !== "string" || typeof entry.thread_name !== "string") continue;
+        if (deletedIds.has(entry.id)) continue;
         const key = entry.id;
         const stamp = Date.parse(entry.updated_at ?? "") || 0;
         const current = latest.get(key);
@@ -909,13 +1132,21 @@ async function mergeSessionIndex(config) {
 }
 
 async function synchronizeFiles(config) {
-  const grouped = await collectAllCandidates(config);
-  const candidatesByThread = groupCandidatesByThread(grouped);
+  let grouped = await collectAllCandidates(config);
+  let candidatesByThread = groupCandidatesByThread(grouped);
+  const deleteState = await resolveDeleteStates(config, candidatesByThread);
+  const locked = await collectLockedThreadIds(config);
+  const deletion = deleteState.disabled
+    ? { appliedIds: new Set(), deferredIds: new Set(), resultsByHome: new Map() }
+    : await applyThreadDeletions(config, deleteState, candidatesByThread, locked);
+  if (deletion.appliedIds.size > 0) {
+    grouped = await collectAllCandidates(config);
+    candidatesByThread = groupCandidatesByThread(grouped);
+  }
   const archiveState = config.sync.includeArchived === false
     ? { archivedById: new Map(), observations: new Map(), changedIds: new Set(), needsApplyIds: new Set(), eventsWritten: 0, disabled: true }
     : await resolveArchiveStates(config, candidatesByThread);
   const active = await collectActiveThreadIds(config);
-  const locked = await collectLockedThreadIds(config);
   const homeProviders = new Map();
   for (const home of config.homes) homeProviders.set(home.name, await readConfiguredProvider(home.path));
   let copiedToCanonical = 0;
@@ -986,7 +1217,7 @@ async function synchronizeFiles(config) {
       archiveMoves += await moveOppositeCopies(candidates, home.name, home.path, desiredBucket, destination);
     }
   }
-  await mergeSessionIndex(config);
+  await mergeSessionIndex(config, deletion.appliedIds);
   const archiveDatabaseUpdates = {};
   let archiveDatabaseConsistent = true;
   if (!archiveState.disabled) {
@@ -999,7 +1230,22 @@ async function synchronizeFiles(config) {
       await writeArchiveSnapshots(config, reconciledObservations);
     }
   }
-  return { sessions: candidatesByThread.size, rollouts: grouped.size, copiedToCanonical, copiedToHomes, conflicts, archiveMoves, archiveEventsWritten: archiveState.eventsWritten, archiveDatabaseUpdates, archiveDatabaseConsistent };
+  const reconciledForPresence = groupCandidatesByThread(await collectAllCandidates(config));
+  await writeThreadPresenceSnapshots(config, reconciledForPresence, deleteState.deletedIds);
+  return {
+    sessions: candidatesByThread.size,
+    rollouts: grouped.size,
+    copiedToCanonical,
+    copiedToHomes,
+    conflicts,
+    archiveMoves,
+    archiveEventsWritten: archiveState.eventsWritten,
+    deleteEventsWritten: deleteState.eventsWritten,
+    deletedThreads: deletion.appliedIds.size,
+    deferredThreadDeletes: deletion.deferredIds.size,
+    archiveDatabaseUpdates,
+    archiveDatabaseConsistent
+  };
 }
 
 async function refreshProvider(config, home) {
@@ -1076,7 +1322,12 @@ async function main() {
   try {
     if (command === "start" || command === "sync" || command === "pull" || command === "drain") await gitPull(config);
     await new Promise((resolve) => setTimeout(resolve, config.sync.settleMilliseconds));
+    // Capture Project removals before starting any app-server process. Older
+    // clients can re-run their legacy Project migration at app-server startup
+    // and otherwise recreate a Project that the user just deleted.
+    await collectUiMetadata(config, dataRepoRoot);
     const summary = await synchronizeFiles(config);
+    const uiMetadata = await collectUiMetadata(config, dataRepoRoot);
     summary.indexRefresh = {};
     for (const home of config.homes) {
       const indexResult = await refreshThreadIndex(config, home);
@@ -1084,13 +1335,13 @@ async function main() {
       await log(`thread index refresh ${home.name}: ${JSON.stringify(indexResult)}`);
       await refreshProvider(config, home);
     }
-    const uiMetadata = await collectUiMetadata(config, dataRepoRoot);
     summary.uiMetadata = { projects: uiMetadata.projects.length, names: Object.keys(uiMetadata.threadNames).length, homes: {} };
     for (const home of config.homes) {
       const result = await applyUiMetadata(config, home, uiMetadata);
       summary.uiMetadata.homes[home.name] = result;
       await log(`ui metadata sync ${home.name}: ${JSON.stringify(result)}`);
     }
+    await writeUiMetadataObservations(config, dataRepoRoot, uiMetadata);
     if (command !== "pull") await gitCommitAndPush(config, summary);
     await fsp.rm(path.join(stateDir, "pending"), { force: true });
     await log(`completed ${command}: ${JSON.stringify(summary)}`);

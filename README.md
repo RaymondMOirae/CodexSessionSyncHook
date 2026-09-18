@@ -17,6 +17,8 @@
 - `SessionStart` 自动 fetch/rebase、导入会话、刷新 Provider 和线程索引。
 - `SessionEnd` 在后台防抖后 commit/push。
 - 将 archive/unarchive 作为独立状态事件同步，避免旧的 active 副本让归档对话重新出现。
+- 可选传播 task 与 Project 删除；删除使用 Git tombstone，避免另一设备或 Home 的旧副本复活已删除内容。
+- 同步收敛 SQLite、Project/thread 归属、全局 UI 状态、顺序和映射，让侧边栏与底层 archive/delete 状态一致。
 - 未显式配置 `model_provider` 的 Home 默认按 OpenAI Provider 处理。
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
@@ -174,7 +176,7 @@ codex-history-sync doctor
 |---|---:|---|
 | `includeArchived` | `true` | 同步归档会话 |
 | `includeSessionIndex` | `true` | 合并会话名称索引 |
-| `propagateDeletes` | `false` | 删除默认不传播 |
+| `propagateDeletes` | `false` | 为 `true` 时传播 task 与 Project 删除并写入 tombstone；这是破坏性操作，默认关闭 |
 | `refreshThreadIndex` | `true` | 导入后调用每个 Home 的 Codex `thread/list` 补建线程索引 |
 | `indexRefreshTimeoutSeconds` | `120` | 每个 Home 的索引刷新超时 |
 | `includeUiMetadata` | `true` | 同步名称、Project 定义和线程的 Project 归属 |
@@ -187,6 +189,7 @@ codex-history-sync doctor
 ```text
 Windows 登录
   → fetch/rebase
+  → 在启动 app-server 前捕获 Project 删除，防止旧迁移状态把它重新创建
   → 合并数据仓库与所有 Codex Home
   → 按目标 Home 转换 Provider 元数据
   → 刷新线程索引及 UI 元数据
@@ -213,7 +216,12 @@ data/archived_sessions/**/*.jsonl
 data/session_index.jsonl
 data/ui-metadata.json
 data/archive-events/<session-id>/*.json
+data/delete-events/<session-id>/*.json
+data/project-events/<project-key>/*.json
 ```
+
+同步器不会强制关闭正在工作的桌面客户端。已经打开的窗口若仍持有旧侧边栏缓存，可正常退出并重新启动；
+持久化状态已在同步时写入，下一次启动会加载正确的 archive、删除和 Project 状态。
 
 永远不应提交：
 

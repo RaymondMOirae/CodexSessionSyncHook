@@ -102,7 +102,10 @@ export async function installRepositoryHooks(repoRoot) {
       "data/sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text",
       "data/archived_sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text",
       "data/session_index.jsonl text eol=lf",
-      "data/archive-events/**/*.json text eol=lf"
+      "data/archive-events/**/*.json text eol=lf",
+      "data/delete-events/**/*.json text eol=lf",
+      "data/project-events/**/*.json text eol=lf",
+      "data/ui-metadata.json text eol=lf"
     ];
     const existingAttributes = await fs.readFile(attributesPath, "utf8").catch(() => "");
     const attributeLines = new Set(existingAttributes.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
