@@ -52,7 +52,9 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
       payload: { id: threadId, session_id: threadId, timestamp: "2026-01-01T00:00:00.000Z", cwd: "C:/fixture", source: "exec", model_provider: "openai", history_mode: "paginated" }
     })}\n${JSON.stringify({ timestamp: "2026-01-01T00:00:01.000Z", ordinal: 1, type: "event_msg", payload: { type: "task_started" } })}\n`;
     const sourcePath = path.join(sourceRoot, sourceName);
-    const childPath = path.join(sourceRoot, childName);
+    const childRoot = path.join(homeA, "sessions", "2026", "01", "02");
+    const childPath = path.join(childRoot, childName);
+    await fsp.mkdir(childRoot, { recursive: true });
     await fsp.writeFile(sourcePath, source);
     const sourceRootB = path.join(homeB, "sessions", "2026", "01", "01");
     const sourcePathB = path.join(sourceRootB, sourceName);
@@ -60,7 +62,7 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
     await fsp.writeFile(sourcePathB, source
       .replace('"model_provider":"openai"', '"model_provider":"tencent"')
       .replace("\n{", "\n \n\t\n{"));
-    await fsp.writeFile(childPath, `${JSON.stringify({
+    const childMeta = {
       timestamp: "2026-01-02T00:00:00.000Z",
       ordinal: 2,
       type: "session_meta",
@@ -74,9 +76,16 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
         history_mode: "paginated",
         history_base: { thread_id: threadId, end_ordinal_exclusive: 2, end_byte_offset: Buffer.byteLength(source) }
       }
-    })}\n`);
+    };
+    const childMetaLine = JSON.stringify(childMeta);
+    const appendedEvent = JSON.stringify({ timestamp: "2026-01-02T00:00:01.000Z", ordinal: 3, type: "event_msg", payload: { type: "task_started" } });
+    await fsp.writeFile(childPath, `${childMetaLine}\n${appendedEvent}\n`);
+    const childRootB = path.join(homeB, "sessions", "2026", "01", "02");
+    const childPathB = path.join(childRootB, childName);
+    await fsp.mkdir(childRootB, { recursive: true });
+    await fsp.writeFile(childPathB, `${childMetaLine.replace('"model_provider":"openai"', '"model_provider":"tencent"')}\n`);
     const settled = new Date(Date.now() - 10 * 60_000);
-    await Promise.all([sourcePath, sourcePathB, childPath].map((entry) => fsp.utimes(entry, settled, settled)));
+    await Promise.all([sourcePath, sourcePathB, childPath, childPathB].map((entry) => fsp.utimes(entry, settled, settled)));
 
     await fsp.writeFile(path.join(framework, "sync.config.json"), JSON.stringify({
       schemaVersion: 1,
@@ -96,6 +105,7 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
     assert.equal(summary.rollouts, 2);
     assert.equal(summary.conflicts, 0);
     assert.equal(fs.existsSync(path.join(records, "conflicts", threadId)), false);
+    assert.match(await fsp.readFile(childPathB, "utf8"), /"task_started"/);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }

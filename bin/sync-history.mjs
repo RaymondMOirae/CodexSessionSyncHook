@@ -262,11 +262,14 @@ function normalizePortableLine(line, { firstLine = false, targetProvider = null,
 }
 
 async function transformedLines(filePath, options = {}) {
-  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  let firstLine = true;
   return {
     async *[Symbol.asyncIterator]() {
+      // Open the stream only when iteration starts. Prefix comparison creates
+      // two iterables at once; an eagerly opened readline can otherwise consume
+      // the longer file before its iterator receives the first line.
+      const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+      const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      let firstLine = true;
       try {
         for await (const line of lines) {
           yield normalizePortableLine(line, { ...options, firstLine });
