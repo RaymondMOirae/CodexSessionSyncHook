@@ -190,6 +190,7 @@ test("rebases a stale descendant onto the latest source without losing descendan
     assert.ok(summary.rebasedLineages >= 1);
     const rebased = (await fsp.readFile(childPath, "utf8")).trim().split("\n").map(JSON.parse);
     assert.equal(rebased[0].payload.history_base, undefined);
+    assert.equal(rebased[0].payload.history_mode, "legacy");
     assert.deepEqual(rebased.map((entry) => entry.ordinal), rebased.map((_, index) => index));
     const serialized = JSON.stringify(rebased);
     assert.match(serialized, /turn-base-new/);
@@ -203,6 +204,30 @@ test("rebases a stale descendant onto the latest source without losing descendan
       assert.equal(historyDb.prepare("SELECT count(*) AS count FROM thread_items WHERE thread_id = ?").get(threadId).count, 0);
       historyDb.close();
     }
+
+    // Older framework versions flattened the lineage but left the rollout in
+    // paginated mode. Migrate those files even when the source has not grown.
+    rebased[0].payload.history_mode = "paginated";
+    const legacyMigrationPaths = [
+      path.join(homeA, "sessions", "2026", "02", "02", childName),
+      childPath,
+      path.join(records, "data", "sessions", "2026", "02", "02", childName)
+    ];
+    for (const [variantIndex, rolloutPath] of legacyMigrationPaths.entries()) {
+      const variant = structuredClone(rebased);
+      if (variantIndex < 2) {
+        variant.push({ timestamp: `2026-02-03T00:00:0${5 + variantIndex}Z`, ordinal: variant.length, type: "event_msg", payload: { type: "task_complete", turn_id: `turn-migration-${variantIndex}` } });
+      }
+      await fsp.writeFile(rolloutPath, variant.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+      await fsp.utimes(rolloutPath, settled, settled);
+    }
+    const migrationResult = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
+    assert.equal(migrationResult.status, 0, `${migrationResult.stdout}\n${migrationResult.stderr}`);
+    const migrated = (await fsp.readFile(childPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(migrated[0].payload.history_mode, "legacy");
+    assert.match(JSON.stringify(migrated), /turn-child-only/);
+    assert.match(JSON.stringify(migrated), /turn-migration-0/);
+    assert.match(JSON.stringify(migrated), /turn-migration-1/);
 
     const laterSourceRecord = { timestamp: "2026-02-04T00:00:00Z", ordinal: 5, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-source-later" } };
     await fsp.appendFile(sourcePath, `${JSON.stringify(laterSourceRecord)}\n`);

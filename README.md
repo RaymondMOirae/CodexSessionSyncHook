@@ -18,7 +18,7 @@
 - `SessionEnd` 在后台防抖后 commit/push。
 - 将 archive/unarchive 作为独立状态事件同步，避免旧的 active 副本让归档对话重新出现。
 - 可选传播 task 与 Project 删除；删除使用 Git tombstone，避免另一设备或 Home 的旧副本复活已删除内容。
-- 同步收敛 SQLite、Project/thread 归属、全局 UI 状态、顺序和映射，让侧边栏与底层 archive/delete 状态一致。
+- 同步收敛 SQLite、Project/thread 归属、全局 UI 状态、顺序、映射和 archived 前端隐藏标记，让侧边栏与底层 archive/delete 状态一致。
 - 未显式配置 `model_provider` 的 Home 默认按 OpenAI Provider 处理。
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
@@ -190,7 +190,7 @@ codex-history-sync doctor
 | `lockStaleMinutes` | `30` | 同步锁过期时间 |
 
 分页 lineage 重基会保持目标 task ID 和 rollout ID 不变，清除已经失效的旧 `history_base`，
-记录可继续增量合并的 lineage 标记并重新生成连续 ordinal。目标 Home 未被客户端占用时，框架会先备份
+记录可继续增量合并的 lineage 标记，改为可被旧客户端完整载入的自包含 `legacy` 历史，并重新生成连续 ordinal。目标 Home 未被客户端占用时，框架会先备份
 `state_5.sqlite` 与 `thread_history_1.sqlite`，将 `threads.rollout_path` 切换到合并后的续段，再删除该 task
 的可重建投影行，让 app-server 从新 rollout 重建索引；若目标正占用这个 rollout，则延后到下一次同步，
 但可先写入同一 task 的非活动 rollout，避免热覆盖当前 writer。

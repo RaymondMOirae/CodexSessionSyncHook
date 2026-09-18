@@ -48,6 +48,26 @@ function stateDbPath(homePath) {
   return null;
 }
 
+function synchronizeArchivedUiState(state, activeThreadIds, archivedThreadIds) {
+  if (!activeThreadIds || !archivedThreadIds) return;
+  const persisted = state["electron-persisted-atom-state"] && typeof state["electron-persisted-atom-state"] === "object"
+    ? { ...state["electron-persisted-atom-state"] }
+    : {};
+  for (const threadId of activeThreadIds) delete persisted[`codex-writing-block-deleted-thread-v1:${threadId}`];
+  for (const threadId of archivedThreadIds) persisted[`codex-writing-block-deleted-thread-v1:${threadId}`] = true;
+  state["electron-persisted-atom-state"] = persisted;
+
+  const sidebarOrders = state["sidebar-project-thread-orders"];
+  if (sidebarOrders && typeof sidebarOrders === "object") {
+    state["sidebar-project-thread-orders"] = Object.fromEntries(Object.entries(sidebarOrders).map(([projectId, order]) => [
+      projectId,
+      order && typeof order === "object" && Array.isArray(order.threadIds)
+        ? { ...order, threadIds: order.threadIds.filter((threadId) => !archivedThreadIds.has(threadId)) }
+        : order
+    ]));
+  }
+}
+
 function readSessionNames(filePath, names) {
   if (!fs.existsSync(filePath)) return;
   for (const line of fs.readFileSync(filePath, "utf8").split(/\r?\n/)) {
@@ -416,6 +436,7 @@ export async function applyUiMetadata(config, home, metadata) {
   let backupDir = null;
   const newlyProjectlessThreadIds = new Set();
   const activeThreadIdsForUi = new Set();
+  const archivedThreadIdsForUi = new Set();
   try {
     await client.call("initialize", {
       clientInfo: { name: "codex_history_sync", title: "Codex History Sync", version: "1.0.0" },
@@ -425,7 +446,10 @@ export async function applyUiMetadata(config, home, metadata) {
     const threads = await listAllThreads(client);
     threadCount = threads.length;
     const threadById = new Map(threads.map((thread) => [thread.id, thread]));
-    for (const thread of threads) if (!thread.__syncArchived) activeThreadIdsForUi.add(thread.id);
+    for (const thread of threads) {
+      if (thread.__syncArchived) archivedThreadIdsForUi.add(thread.id);
+      else activeThreadIdsForUi.add(thread.id);
+    }
     const projectPage = await client.call("project/list", { limit: 100 });
     const existingProjects = projectPage.data ?? [];
     const existingByRoots = new Map(existingProjects.map((project) => [rootsKey(project.roots?.map((root) => root.path) ?? []), project]));
@@ -536,6 +560,7 @@ export async function applyUiMetadata(config, home, metadata) {
   const projectless = new Set((state["projectless-thread-ids"] ?? []).filter((threadId) => activeThreadIdsForUi.has(threadId) && !assignments[threadId]));
   for (const threadId of newlyProjectlessThreadIds) if (!assignments[threadId]) projectless.add(threadId);
   state["projectless-thread-ids"] = [...projectless];
+  synchronizeArchivedUiState(state, activeThreadIdsForUi, archivedThreadIdsForUi);
   const hostKey = `local:${home.path.replaceAll("/", "\\")}`;
   const projectMappings = config.sync.propagateDeletes === true
     ? {}
@@ -632,6 +657,7 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
   const dbPath = stateDbPath(home.path);
   const projectsByRoots = new Map();
   let activeThreadIdsForUi = null;
+  let archivedThreadIdsForUi = null;
 
   if (dbPath) {
     const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -647,7 +673,9 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
       }
       const threadColumns = new Set(db.prepare("PRAGMA table_info(threads)").all().map((row) => row.name));
       if (threadColumns.has("archived")) {
-        activeThreadIdsForUi = new Set(db.prepare("SELECT id FROM threads WHERE archived = 0").all().map((row) => row.id));
+        const archiveRows = db.prepare("SELECT id, archived FROM threads").all();
+        activeThreadIdsForUi = new Set(archiveRows.filter((row) => !row.archived).map((row) => row.id));
+        archivedThreadIdsForUi = new Set(archiveRows.filter((row) => Boolean(row.archived)).map((row) => row.id));
       }
     } finally {
       db.close();
@@ -677,6 +705,7 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
     ...projectOrder
   ].filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
   state["projectless-thread-ids"] = (state["projectless-thread-ids"] ?? []).filter((threadId) => (!activeThreadIdsForUi || activeThreadIdsForUi.has(threadId)) && !assignments[threadId]);
+  synchronizeArchivedUiState(state, activeThreadIdsForUi, archivedThreadIdsForUi);
   state["app-server-project-id-by-legacy-project-id-by-host"] = {
     ...(state["app-server-project-id-by-legacy-project-id-by-host"] ?? {}),
     [hostKey]: projectMappings

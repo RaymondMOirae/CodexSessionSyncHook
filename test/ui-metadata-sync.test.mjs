@@ -28,6 +28,10 @@ function createStateDb(home, projects) {
 function globalState(home, projects) {
   const hostKey = `local:${home.replaceAll("/", "\\")}`;
   return {
+    "electron-persisted-atom-state": {
+      "codex-writing-block-deleted-thread-v1:thread-keep": true,
+      "codex-writing-block-deleted-thread-v1:thread-removed": true
+    },
     "local-projects": Object.fromEntries(projects.map((project) => [project.id, {
       id: project.id,
       name: project.name,
@@ -37,6 +41,7 @@ function globalState(home, projects) {
     }])),
     "thread-project-assignments": Object.fromEntries(projects.flatMap((project) => (project.threadIds ?? []).map((threadId) => [threadId, { projectKind: "local", projectId: project.id }]))),
     "project-order": projects.map((project) => project.id),
+    "sidebar-project-thread-orders": Object.fromEntries(projects.map((project) => [project.appId, { threadIds: [...(project.threadIds ?? [])] }])),
     "projectless-thread-ids": [],
     "app-server-project-id-by-legacy-project-id-by-host": {
       [hostKey]: Object.fromEntries(projects.map((project) => [project.id, project.appId]))
@@ -99,6 +104,10 @@ test("propagates a migrated Project deletion and removes stale sidebar state", a
     assert.equal(state["thread-project-assignments"]["thread-removed"], undefined);
     assert.equal(state["thread-project-assignments"]["thread-keep-archived"], undefined);
     assert.equal(state["thread-project-assignments"]["thread-keep"].projectId, keep.id);
+    assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-keep"], undefined);
+    assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-keep-archived"], true);
+    assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-removed"], undefined);
+    assert.deepEqual(state["sidebar-project-thread-orders"]["app-api-keep"].threadIds, ["thread-keep"]);
     assert.deepEqual(state["project-order"], [keep.id]);
     const hostKey = `local:${api.replaceAll("/", "\\")}`;
     assert.deepEqual(state["app-server-project-id-by-legacy-project-id-by-host"][hostKey], { [keep.id]: "app-api-keep" });

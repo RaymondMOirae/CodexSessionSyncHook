@@ -277,6 +277,7 @@ async function readSessionMeta(filePath) {
       id,
       rolloutId,
       provider: typeof payload.model_provider === "string" ? payload.model_provider : null,
+      historyMode: typeof payload.history_mode === "string" ? payload.history_mode : null,
       timestamp: typeof payload.timestamp === "string" ? payload.timestamp : null,
       ordinal: Number.isSafeInteger(parsed?.ordinal) ? parsed.ordinal : 0,
       historyBase: payload?.history_base && typeof payload.history_base === "object" ? payload.history_base : null,
@@ -838,9 +839,13 @@ function portableRecordFingerprint(record) {
   return JSON.stringify(portable);
 }
 
-async function materializeLatestLineage(source, descendant, rolloutId, standalone = null) {
+async function materializeLatestLineage(source, descendant, rolloutId, standalone = null, additionalDescendants = []) {
   const sourceRecords = await readCompleteRolloutRecords(source.filePath);
   const descendantRecords = await readCompleteRolloutRecords(descendant.filePath);
+  const additionalDescendantRecords = [];
+  for (const candidate of additionalDescendants) {
+    additionalDescendantRecords.push({ candidate, records: await readCompleteRolloutRecords(candidate.filePath) });
+  }
   const standaloneRecords = standalone ? await readCompleteRolloutRecords(standalone.filePath) : [];
   if (sourceRecords.length === 0 || descendantRecords.length === 0) return null;
   const outputMeta = structuredClone(standaloneRecords[0] ?? descendantRecords[0]);
@@ -866,6 +871,10 @@ async function materializeLatestLineage(source, descendant, rolloutId, standalon
     const mergedSourceOrdinal = sourceRecords.reduce((maximum, record) => Number.isSafeInteger(record?.ordinal) ? Math.max(maximum, record.ordinal) : maximum, -1);
     delete payload.history_base;
     delete payload.forked_from_ordinal_exclusive;
+    // A materialized lineage is a self-contained rollout. Marking it as
+    // paginated makes legacy desktop clients hydrate only the newest page even
+    // though every earlier turn is present in this file.
+    payload.history_mode = "legacy";
     payload.model_provider = targetProvider;
     payload.sync_lineage_base = {
       thread_id: source.meta.id,
@@ -891,7 +900,8 @@ async function materializeLatestLineage(source, descendant, rolloutId, standalon
       }
       const candidates = [
         { records: sourceRecords.slice(1), strip: source.meta.provider !== targetProvider, origin: "source", originRank: 1 },
-        { records: descendantRecords.slice(1), strip: descendant.meta.provider !== targetProvider, origin: "descendant", originRank: 2 }
+        { records: descendantRecords.slice(1), strip: descendant.meta.provider !== targetProvider, origin: "descendant", originRank: 2 },
+        ...additionalDescendantRecords.map(({ candidate, records }, index) => ({ records: records.slice(1), strip: candidate.meta.provider !== targetProvider, origin: "descendant", originRank: 3 + index }))
       ];
       for (const candidate of candidates) {
         for (const [index, record] of candidate.records.entries()) {
@@ -917,10 +927,16 @@ async function materializeLatestLineage(source, descendant, rolloutId, standalon
       for (const [index, record] of sourceTail.entries()) {
         extraEntries.push({ record, strip: source.meta.provider !== targetProvider, origin: "source", originRank: 1, index });
       }
-      for (const [index, record] of descendantRecords.slice(1).entries()) {
-        const turnIds = collectRecordTurnIds(record);
-        if (turnIds.size > 0 && [...turnIds].some((id) => sourceTailTurnIds.has(id))) continue;
-        extraEntries.push({ record, strip: descendant.meta.provider !== targetProvider, origin: "descendant", originRank: 2, index });
+      const descendantVariants = [
+        { candidate: descendant, records: descendantRecords },
+        ...additionalDescendantRecords
+      ];
+      for (const [variantIndex, { candidate, records }] of descendantVariants.entries()) {
+        for (const [index, record] of records.slice(1).entries()) {
+          const turnIds = collectRecordTurnIds(record);
+          if (turnIds.size > 0 && [...turnIds].some((id) => sourceTailTurnIds.has(id))) continue;
+          extraEntries.push({ record, strip: candidate.meta.provider !== targetProvider, origin: "descendant", originRank: 2 + variantIndex, index });
+        }
       }
     }
 
@@ -962,7 +978,7 @@ async function materializeLatestLineage(source, descendant, rolloutId, standalon
       allPaths: [outputPath],
       sourceName: "lineage-materialization",
       canonical: false,
-      materializedFrom: { source: source.filePath, descendant: descendant.filePath }
+      materializedFrom: { source: source.filePath, descendants: [descendant.filePath, ...additionalDescendants.map((candidate) => candidate.filePath)] }
     },
     appendedDescendantRecords,
     mergedRecords
@@ -1461,30 +1477,37 @@ async function materializeStaleLineages(config, grouped) {
     rankedSources.sort((a, b) => b.latest - a.latest || b.source.stat.mtimeMs - a.source.stat.mtimeMs || b.source.stat.size - a.source.stat.size);
     const source = rankedSources[0].source;
     const latestSourceOrdinal = rankedSources[0].latest;
-    const descendant = await selectWinner(descendants[0].meta.rolloutId, descendants, config.sync.stripEncryptedContent);
+    const rankedDescendants = [];
+    for (const candidate of descendants) rankedDescendants.push({ candidate, latest: await latestOrdinal(candidate) });
+    rankedDescendants.sort((a, b) => b.latest - a.latest || b.candidate.stat.mtimeMs - a.candidate.stat.mtimeMs || b.candidate.stat.size - a.candidate.stat.size);
+    const descendant = rankedDescendants[0]?.candidate;
     if (!descendant) continue;
     const frozenAt = Number(descendant.meta.historyBase?.end_ordinal_exclusive ?? descendant.meta.syncLineageBase?.original_end_ordinal_exclusive);
     const mergedSourceOrdinal = Number(descendant.meta.syncLineageBase?.merged_source_ordinal);
     if (!Number.isSafeInteger(frozenAt)) continue;
-    if (Number.isSafeInteger(mergedSourceOrdinal)) {
-      if (latestSourceOrdinal <= mergedSourceOrdinal) continue;
-    } else if (latestSourceOrdinal <= frozenAt) {
-      continue;
+    const needsLegacyMigration = descendants.some((candidate) => Boolean(candidate.meta.syncLineageBase) && candidate.meta.historyMode !== "legacy");
+    if (!needsLegacyMigration) {
+      if (Number.isSafeInteger(mergedSourceOrdinal)) {
+        if (latestSourceOrdinal <= mergedSourceOrdinal) continue;
+      } else if (latestSourceOrdinal <= frozenAt) {
+        continue;
+      }
     }
     const standaloneCandidates = candidates.filter((candidate) => candidate.meta.rolloutId === descendant.meta.rolloutId && !candidate.meta.historyBase);
     const rankedStandalone = [];
     for (const candidate of standaloneCandidates) rankedStandalone.push({ candidate, latest: await latestOrdinal(candidate) });
     rankedStandalone.sort((a, b) => b.latest - a.latest || b.candidate.stat.mtimeMs - a.candidate.stat.mtimeMs || b.candidate.stat.size - a.candidate.stat.size);
     const standalone = rankedStandalone[0]?.candidate ?? null;
+    const additionalDescendants = descendants.filter((candidate) => candidate.filePath !== descendant.filePath && candidate.filePath !== standalone?.filePath);
     const targetProvider = homeProviders.get(descendant.sourceName) ?? descendant.meta.provider;
     const target = { ...descendant, meta: { ...descendant.meta, provider: targetProvider } };
-    const materialized = await materializeLatestLineage(source, target, descendant.meta.rolloutId, standalone);
+    const materialized = await materializeLatestLineage(source, target, descendant.meta.rolloutId, standalone, additionalDescendants);
     if (!materialized) continue;
     materializations.push(materialized);
     const list = grouped.get(descendant.meta.rolloutId) ?? [];
     list.push(materialized.candidate);
     grouped.set(descendant.meta.rolloutId, list);
-    await log(`rebased stale lineage ${threadId} rollout ${descendant.meta.rolloutId}: source ${frozenAt} -> ${latestSourceOrdinal}, merged ${materialized.mergedRecords} records, appended ${materialized.appendedDescendantRecords} descendant records`);
+    await log(`${needsLegacyMigration ? "migrated materialized lineage" : "rebased stale lineage"} ${threadId} rollout ${descendant.meta.rolloutId}: source ${frozenAt} -> ${latestSourceOrdinal}, merged ${materialized.mergedRecords} records, appended ${materialized.appendedDescendantRecords} descendant records`);
   }
   return materializations;
 }
