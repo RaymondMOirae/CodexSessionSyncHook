@@ -125,3 +125,65 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
     await fsp.rm(root, { recursive: true, force: true });
   }
 });
+
+test("rebases a stale descendant onto the latest source without losing descendant-only turns", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-lineage-rebase-"));
+  try {
+    const framework = path.join(root, "framework");
+    const homeA = path.join(root, "home-a");
+    const homeB = path.join(root, "home-b");
+    const records = path.join(root, "records");
+    await fsp.mkdir(framework, { recursive: true });
+    await fsp.cp(path.join(repoRoot, "bin"), path.join(framework, "bin"), { recursive: true });
+    await Promise.all([homeA, homeB, records].map((entry) => fsp.mkdir(entry, { recursive: true })));
+    await fsp.writeFile(path.join(homeA, "config.toml"), 'model_provider = "openai"\n');
+    await fsp.writeFile(path.join(homeB, "config.toml"), 'model_provider = "tencent"\n');
+
+    const threadId = "33333333-3333-7333-8333-333333333333";
+    const childRolloutId = "44444444-4444-7444-8444-444444444444";
+    const sourceName = `rollout-2026-02-01T00-00-00-${threadId}.jsonl`;
+    const childName = `rollout-2026-02-02T00-00-00-${threadId}_${childRolloutId}.jsonl`;
+    const sourcePath = path.join(homeA, "sessions", "2026", "02", "01", sourceName);
+    const childPath = path.join(homeB, "sessions", "2026", "02", "02", childName);
+    await fsp.mkdir(path.dirname(sourcePath), { recursive: true });
+    await fsp.mkdir(path.dirname(childPath), { recursive: true });
+    const sourceRecords = [
+      { timestamp: "2026-02-01T00:00:00Z", ordinal: 0, type: "session_meta", payload: { id: threadId, session_id: threadId, timestamp: "2026-02-01T00:00:00Z", cwd: "C:/fixture", source: "exec", model_provider: "openai", history_mode: "paginated" } },
+      { timestamp: "2026-02-01T00:00:01Z", ordinal: 1, type: "event_msg", payload: { type: "task_started", turn_id: "turn-base-old" } },
+      { timestamp: "2026-02-01T00:00:02Z", ordinal: 2, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-base-old" } },
+      { timestamp: "2026-02-03T00:00:01Z", ordinal: 3, type: "event_msg", payload: { type: "task_started", turn_id: "turn-base-new" } },
+      { timestamp: "2026-02-03T00:00:02Z", ordinal: 4, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-base-new" } }
+    ];
+    const frozenPrefix = sourceRecords.slice(0, 3).map((entry) => `${JSON.stringify(entry)}\n`).join("");
+    await fsp.writeFile(sourcePath, sourceRecords.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    const childRecords = [
+      { timestamp: "2026-02-02T00:00:00Z", ordinal: 3, type: "session_meta", payload: { id: threadId, session_id: threadId, timestamp: "2026-02-02T00:00:00Z", cwd: "C:/fixture", source: "exec", model_provider: "tencent", history_mode: "paginated", history_base: { thread_id: threadId, end_ordinal_exclusive: 3, end_byte_offset: Buffer.byteLength(frozenPrefix) } } },
+      { timestamp: "2026-02-02T00:00:01Z", ordinal: 4, type: "event_msg", payload: { type: "task_started", turn_id: "turn-child-only" } },
+      { timestamp: "2026-02-02T00:00:02Z", ordinal: 5, type: "response_item", payload: { type: "message", id: "msg-child", role: "user", content: [{ type: "input_text", text: "child work" }], internal_chat_message_metadata_passthrough: { turn_id: "turn-child-only" } } },
+      { timestamp: "2026-02-02T00:00:03Z", ordinal: 6, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-child-only" } }
+    ];
+    await fsp.writeFile(childPath, childRecords.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    const settled = new Date(Date.now() - 10 * 60_000);
+    await Promise.all([sourcePath, childPath].map((entry) => fsp.utimes(entry, settled, settled)));
+    await fsp.writeFile(path.join(framework, "sync.config.json"), JSON.stringify({
+      schemaVersion: 1,
+      homes: [{ name: "a", path: homeA }, { name: "b", path: homeB }],
+      git: { dataRepository: records, remote: "origin", branch: "main", autoPull: false, autoPush: false, commitDebounceSeconds: 1 },
+      providerSync: { enabled: false },
+      sync: { includeArchived: true, includeSessionIndex: false, refreshThreadIndex: false, includeUiMetadata: false, stripEncryptedContent: true, settleMilliseconds: 1, lockStaleMinutes: 30 }
+    }, null, 2));
+
+    const result = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const summary = JSON.parse(result.stdout).summary;
+    assert.ok(summary.rebasedLineages >= 1);
+    const rebased = (await fsp.readFile(childPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(rebased[0].payload.history_base, undefined);
+    assert.deepEqual(rebased.map((entry) => entry.ordinal), rebased.map((_, index) => index));
+    const serialized = JSON.stringify(rebased);
+    assert.match(serialized, /turn-base-new/);
+    assert.match(serialized, /turn-child-only/);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});

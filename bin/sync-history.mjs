@@ -606,7 +606,7 @@ async function snapshotActiveCandidates(candidates, rolloutId) {
   const root = path.join(stateDir, "active-snapshots", `${process.pid}-${Date.now()}-${rolloutId}`);
   const snapshots = [];
   for (const candidate of candidates) {
-    if (candidate.sourceName === "git") {
+    if (candidate.sourceName === "git" || candidate.sourceName === "lineage-materialization") {
       snapshots.push(candidate);
       continue;
     }
@@ -649,6 +649,163 @@ async function destinationMatches(destination, expectedDigest, targetProvider, s
   if (stripEncryptedContent && await fileContainsEncryptedContent(destination)) return false;
   if (await canonicalDigest(destination, stripEncryptedContent) !== expectedDigest) return false;
   return providerFromFirstLine(await readFirstLine(destination)) === targetProvider;
+}
+
+async function resetThreadHistoryProjection(home, threadId) {
+  const dbPath = path.join(home.path, "thread_history_1.sqlite");
+  if (!(await exists(dbPath))) return { skipped: true, reason: "thread-history-db-not-found" };
+  const { DatabaseSync, backup: sqliteBackup } = await import("node:sqlite");
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  const backupRoot = path.join(home.path, "backups_state", "lineage-rebase", stamp);
+  await fsp.mkdir(backupRoot, { recursive: true });
+  const backupDb = new DatabaseSync(dbPath, { readOnly: true });
+  try { await sqliteBackup(backupDb, path.join(backupRoot, "thread_history_1.sqlite")); } finally { backupDb.close(); }
+  const db = new DatabaseSync(dbPath);
+  let deleted = 0;
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const table of ["thread_items", "thread_turns", "thread_realtime_items", "thread_history_projection_state"]) {
+        const result = db.prepare(`DELETE FROM ${table} WHERE thread_id = ?`).run(threadId);
+        deleted += Number(result.changes ?? 0);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    db.close();
+  }
+  return { ok: true, deleted, backupDir: backupRoot };
+}
+
+function collectRecordTurnIds(value) {
+  const ids = new Set();
+  const payload = value?.payload;
+  if (!payload || typeof payload !== "object") return ids;
+  for (const candidate of [
+    payload.turn_id,
+    payload.root_turn_id,
+    payload.internal_chat_message_metadata_passthrough?.turn_id,
+    payload.item?.turn_id
+  ]) {
+    if (typeof candidate === "string" && candidate) ids.add(candidate);
+  }
+  return ids;
+}
+
+async function readCompleteRolloutRecords(filePath) {
+  const records = [];
+  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try { records.push(JSON.parse(line)); } catch { break; }
+    }
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+  return records;
+}
+
+async function readLastRolloutOrdinal(filePath) {
+  let ordinal = -1;
+  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const value = JSON.parse(line);
+        if (Number.isSafeInteger(value?.ordinal)) ordinal = Math.max(ordinal, value.ordinal);
+      } catch {
+        break;
+      }
+    }
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+  return ordinal;
+}
+
+async function materializeLatestLineage(source, descendant, rolloutId) {
+  const sourceRecords = await readCompleteRolloutRecords(source.filePath);
+  const descendantRecords = await readCompleteRolloutRecords(descendant.filePath);
+  if (sourceRecords.length === 0 || descendantRecords.length === 0) return null;
+  const descendantMeta = descendantRecords[0];
+  if (descendantMeta?.type !== "session_meta") return null;
+
+    const sourceTurnIds = new Set();
+  for (const record of sourceRecords) for (const id of collectRecordTurnIds(record)) sourceTurnIds.add(id);
+  const targetProvider = descendant.meta.provider ?? source.meta.provider ?? "openai";
+  const root = path.join(stateDir, "lineage-materializations", `${process.pid}-${Date.now()}-${rolloutId}`);
+  const outputPath = path.join(root, path.basename(descendant.filePath));
+  await fsp.mkdir(root, { recursive: true });
+  const output = fs.createWriteStream(outputPath, { encoding: "utf8", flags: "wx" });
+  let ordinal = 0;
+  let appendedDescendantRecords = 0;
+  const writeRecord = async (record, stripEncryptedContent) => {
+    const portable = structuredClone(record);
+    portable.ordinal = ordinal++;
+    if (stripEncryptedContent) removeEncryptedContent(portable);
+    if (!output.write(`${JSON.stringify(portable)}\n`)) await once(output, "drain");
+  };
+  try {
+    const meta = structuredClone(descendantMeta);
+    const payload = meta?.payload ?? meta;
+    delete payload.history_base;
+    delete payload.forked_from_ordinal_exclusive;
+    payload.model_provider = targetProvider;
+    await writeRecord(meta, false);
+
+    for (const record of sourceRecords.slice(1)) {
+      const portable = structuredClone(record);
+      if (portable?.type === "turn_context" && portable.payload && typeof portable.payload === "object") {
+        delete portable.payload.comp_hash;
+      }
+      await writeRecord(portable, source.meta.provider !== targetProvider);
+    }
+    for (const record of descendantRecords.slice(1)) {
+      const turnIds = collectRecordTurnIds(record);
+      if (turnIds.size > 0 && [...turnIds].some((id) => sourceTurnIds.has(id))) continue;
+      const portable = structuredClone(record);
+      if (portable?.type === "turn_context" && portable.payload && typeof portable.payload === "object") {
+        delete portable.payload.comp_hash;
+      }
+      await writeRecord(portable, false);
+      appendedDescendantRecords += 1;
+    }
+    output.end();
+    await once(output, "finish");
+  } catch (error) {
+    output.destroy();
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+  const meta = await readSessionMeta(outputPath);
+  if (!meta) {
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
+  return {
+    root,
+    candidate: {
+      ...descendant,
+      filePath: outputPath,
+      meta,
+      stat: await fsp.stat(outputPath),
+      allPaths: [outputPath],
+      sourceName: "lineage-materialization",
+      canonical: false,
+      materializedFrom: { source: source.filePath, descendant: descendant.filePath }
+    },
+    appendedDescendantRecords
+  };
 }
 
 async function buildIndex(root, bucket) {
@@ -1123,7 +1280,48 @@ async function collectLockedThreadIdsByHome(config) {
   return result;
 }
 
+async function materializeStaleLineages(config, grouped) {
+  const byThread = groupCandidatesByThread(grouped);
+  const homeProviders = new Map();
+  for (const home of config.homes) homeProviders.set(home.name, await readConfiguredProvider(home.path));
+  const materializations = [];
+  const ordinalCache = new Map();
+  const latestOrdinal = async (candidate) => {
+    if (!ordinalCache.has(candidate.filePath)) ordinalCache.set(candidate.filePath, await readLastRolloutOrdinal(candidate.filePath));
+    return ordinalCache.get(candidate.filePath);
+  };
+  for (const [threadId, candidates] of byThread) {
+    const descendants = candidates.filter((candidate) => candidate.meta.historyBase?.thread_id === threadId);
+    if (descendants.length === 0) continue;
+    const sources = candidates.filter((candidate) => candidate.meta.rolloutId === threadId && !candidate.meta.historyBase);
+    if (sources.length === 0) continue;
+    const rankedSources = [];
+    for (const source of sources) rankedSources.push({ source, latest: await latestOrdinal(source) });
+    rankedSources.sort((a, b) => b.latest - a.latest || b.source.stat.mtimeMs - a.source.stat.mtimeMs || b.source.stat.size - a.source.stat.size);
+    const source = rankedSources[0].source;
+    const latestSourceOrdinal = rankedSources[0].latest;
+    const descendant = await selectWinner(descendants[0].meta.rolloutId, descendants, config.sync.stripEncryptedContent);
+    if (!descendant) continue;
+    const frozenAt = Number(descendant.meta.historyBase?.end_ordinal_exclusive);
+    if (!Number.isSafeInteger(frozenAt) || latestSourceOrdinal <= frozenAt) continue;
+    const targetProvider = homeProviders.get(descendant.sourceName) ?? descendant.meta.provider;
+    const target = { ...descendant, meta: { ...descendant.meta, provider: targetProvider } };
+    const materialized = await materializeLatestLineage(source, target, descendant.meta.rolloutId);
+    if (!materialized) continue;
+    materializations.push(materialized);
+    const list = grouped.get(descendant.meta.rolloutId) ?? [];
+    list.push(materialized.candidate);
+    grouped.set(descendant.meta.rolloutId, list);
+    await log(`rebased stale lineage ${threadId} rollout ${descendant.meta.rolloutId}: source ${frozenAt} -> ${latestSourceOrdinal}, appended ${materialized.appendedDescendantRecords} descendant records`);
+  }
+  return materializations;
+}
+
 async function selectWinner(id, candidates, stripEncryptedContent = true) {
+  const materialized = candidates
+    .filter((candidate) => candidate.sourceName === "lineage-materialization")
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs || b.stat.size - a.stat.size)[0];
+  if (materialized) return { ...materialized, digest: await canonicalDigest(materialized.filePath, stripEncryptedContent) };
   const enriched = [];
   for (const candidate of candidates) enriched.push({ ...candidate, digest: await canonicalDigest(candidate.filePath, stripEncryptedContent) });
   const digestGroups = new Map();
@@ -1214,6 +1412,7 @@ async function mergeSessionIndex(config, deletedIds = new Set()) {
 
 async function synchronizeFiles(config) {
   let grouped = await collectAllCandidates(config);
+  const lineageMaterializations = await materializeStaleLineages(config, grouped);
   let candidatesByThread = groupCandidatesByThread(grouped);
   const deleteState = await resolveDeleteStates(config, candidatesByThread);
   const locked = await collectLockedThreadIds(config);
@@ -1236,6 +1435,9 @@ async function synchronizeFiles(config) {
   let conflicts = 0;
   let archiveMoves = 0;
   let activeSnapshotRollouts = 0;
+  let rebasedLineages = lineageMaterializations.length;
+  const lineageProjectionResets = {};
+  const rebasedThreadIds = new Set(lineageMaterializations.map((entry) => entry.candidate.meta.id));
   for (const [rolloutId, candidates] of grouped) {
     const threadIds = new Set(candidates.map((candidate) => candidate.meta.id));
     const archiveTransition = [...threadIds].some((id) => archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id));
@@ -1323,6 +1525,16 @@ async function synchronizeFiles(config) {
       if (snapshot) await fsp.rm(snapshot.root, { recursive: true, force: true }).catch(() => {});
     }
   }
+  for (const threadId of rebasedThreadIds) {
+    lineageProjectionResets[threadId] = {};
+    for (const home of config.homes) {
+      if (lockedByHome.get(home.name)?.has(threadId)) {
+        lineageProjectionResets[threadId][home.name] = { deferred: true, reason: "writer-locked" };
+        continue;
+      }
+      lineageProjectionResets[threadId][home.name] = await resetThreadHistoryProjection(home, threadId);
+    }
+  }
   await mergeSessionIndex(config, deletion.appliedIds);
   const archiveDatabaseUpdates = {};
   let archiveDatabaseConsistent = true;
@@ -1338,6 +1550,7 @@ async function synchronizeFiles(config) {
   }
   const reconciledForPresence = groupCandidatesByThread(await collectAllCandidates(config));
   await writeThreadPresenceSnapshots(config, reconciledForPresence, deleteState.deletedIds);
+  for (const materialization of lineageMaterializations) await fsp.rm(materialization.root, { recursive: true, force: true }).catch(() => {});
   return {
     sessions: candidatesByThread.size,
     rollouts: grouped.size,
@@ -1346,6 +1559,8 @@ async function synchronizeFiles(config) {
     conflicts,
     archiveMoves,
     activeSnapshotRollouts,
+    rebasedLineages,
+    lineageProjectionResets,
     archiveEventsWritten: archiveState.eventsWritten,
     deleteEventsWritten: deleteState.eventsWritten,
     deletedThreads: deletion.appliedIds.size,

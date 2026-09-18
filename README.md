@@ -25,6 +25,7 @@
 - 活跃会话以“截止扫描时最后一个完整 JSONL 记录”的只读快照同步到 Git 和未持锁 Home；绝不覆盖持有 writer-lock 的源文件。
 - archived task 的 Project 归属保留在 SQLite 便于 unarchive 恢复，但不会写入活动侧边栏 assignment。
 - 保留分页会话同一 thread 下的全部物理 rollout，避免续段覆盖其 `history_base` 前置段。
+- 当分页续段仍冻结在旧 `history_base`、而源 rollout 已继续增长时，自动将续段重基到最新源历史，并保留续段独有的完整回合。
 - 一端历史是另一端前缀时保留较长版本。
 - 真正分叉的同一 rollout 保存到 `conflicts/<rollout-id>/`，不静默覆盖。
 - 不同步认证、配置、SQLite、WAL、日志、缓存和运行锁。
@@ -184,6 +185,11 @@ codex-history-sync doctor
 | `stripEncryptedContent` | `true` | 从跨 Home/Provider 的可移植副本中移除账号或 Provider 绑定的 `encrypted_content`，保留可见消息、工具记录和推理摘要；避免切换账号或 Provider 后继续会话时报 `invalid_encrypted_content` |
 | `settleMilliseconds` | `1500` | 扫描前等待文件写入稳定 |
 | `lockStaleMinutes` | `30` | 同步锁过期时间 |
+
+分页 lineage 重基会保持目标 task ID 和 rollout ID 不变，清除已经失效的旧 `history_base`，
+重新生成连续 ordinal。目标 Home 未被客户端占用时，框架会先备份
+`thread_history_1.sqlite`，再删除该 task 的可重建投影行，让 app-server 从新 rollout 重建索引；
+若目标正被 writer lock 占用，则延后到下一次同步执行，避免热覆盖活动会话。
 
 ## 生命周期
 
