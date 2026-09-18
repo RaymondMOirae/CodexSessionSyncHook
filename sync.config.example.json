@@ -4,7 +4,13 @@
     {
       "name": "official-codex",
       "path": "~/.codex",
-      "installHooks": true
+      "installHooks": true,
+      "runtimeProcessPaths": [
+        "~/AppData/Local/OpenAI/Codex"
+      ],
+      "runtimeCommandLineContains": [
+        "app-server"
+      ]
     },
     {
       "name": "custom-codex",
