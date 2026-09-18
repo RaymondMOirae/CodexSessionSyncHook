@@ -18,7 +18,7 @@
 - `SessionEnd` 在后台防抖后 commit/push。
 - 将 archive/unarchive 作为独立状态事件同步，避免旧的 active 副本让归档对话重新出现。
 - 可选传播 task 与 Project 删除；删除使用 Git tombstone，避免另一设备或 Home 的旧副本复活已删除内容。
-- 同步收敛 SQLite、Project/thread 归属、全局 UI 状态、顺序、映射和 archived 前端隐藏标记，让侧边栏与底层 archive/delete 状态一致。
+- 同步收敛 SQLite、Project/thread 归属、全局 UI 状态、顺序和映射；Git 保留完整名称索引，而各 Home 的 `session_index.jsonl` 会排除 archived task，避免 Recents 启动缓存将其重新显示。
 - 未显式配置 `model_provider` 的 Home 默认按 OpenAI Provider 处理。
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
@@ -26,7 +26,7 @@
 - archived task 的 Project 归属保留在 SQLite 便于 unarchive 恢复，但不会写入活动侧边栏 assignment。
 - 保留分页会话同一 thread 下的全部物理 rollout，避免续段覆盖其 `history_base` 前置段。
 - 当分页续段仍冻结在旧 `history_base`、而源 rollout 已继续增长时，自动将续段重基到最新源历史，并保留续段独有的完整回合；后续源段再次增长时继续增量合并。
-- 重基后同步更新目标 Home 的 `threads.rollout_path` 并重建历史投影；活动 task 的当前 rollout 不热覆盖，但同一 task 的非活动 rollout 可以安全预置。
+- 重基后同步更新目标 Home 的 `threads.rollout_path` 和 `threads.history_mode` 并重建历史投影，避免客户端按旧的 `paginated` 数据库状态重新截短完整历史；活动 task 的当前 rollout 不热覆盖，但同一 task 的非活动 rollout 可以安全预置。
 - 一端历史是另一端前缀时保留较长版本。
 - 真正分叉的同一 rollout 保存到 `conflicts/<rollout-id>/`，不静默覆盖。
 - 不同步认证、配置、SQLite、WAL、日志、缓存和运行锁。

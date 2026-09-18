@@ -105,7 +105,7 @@ test("propagates a migrated Project deletion and removes stale sidebar state", a
     assert.equal(state["thread-project-assignments"]["thread-keep-archived"], undefined);
     assert.equal(state["thread-project-assignments"]["thread-keep"].projectId, keep.id);
     assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-keep"], undefined);
-    assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-keep-archived"], true);
+    assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-keep-archived"], undefined);
     assert.equal(state["electron-persisted-atom-state"]["codex-writing-block-deleted-thread-v1:thread-removed"], undefined);
     assert.deepEqual(state["sidebar-project-thread-orders"]["app-api-keep"].threadIds, ["thread-keep"]);
     assert.deepEqual(state["project-order"], [keep.id]);

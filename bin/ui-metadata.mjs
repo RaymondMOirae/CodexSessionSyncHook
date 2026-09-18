@@ -54,7 +54,10 @@ function synchronizeArchivedUiState(state, activeThreadIds, archivedThreadIds) {
     ? { ...state["electron-persisted-atom-state"] }
     : {};
   for (const threadId of activeThreadIds) delete persisted[`codex-writing-block-deleted-thread-v1:${threadId}`];
-  for (const threadId of archivedThreadIds) persisted[`codex-writing-block-deleted-thread-v1:${threadId}`] = true;
+  // This key records an actual deleted-thread writing block; it is not an
+  // archive visibility flag. Older sync releases wrote it for archived
+  // threads, so remove those stale values while reconciling UI state.
+  for (const threadId of archivedThreadIds) delete persisted[`codex-writing-block-deleted-thread-v1:${threadId}`];
   state["electron-persisted-atom-state"] = persisted;
 
   const sidebarOrders = state["sidebar-project-thread-orders"];

@@ -749,12 +749,20 @@ async function resetThreadHistoryProjection(home, threadId) {
 async function activateThreadRollout(home, threadId, rolloutPath) {
   const dbPath = [path.join(home.path, "state_5.sqlite"), path.join(home.path, "sqlite", "state_5.sqlite")].find((candidate) => fs.existsSync(candidate));
   if (!dbPath) return { skipped: true, reason: "state-db-not-found" };
+  const rolloutMeta = await readSessionMeta(rolloutPath);
+  const desiredHistoryMode = rolloutMeta?.historyMode ?? null;
   const { DatabaseSync, backup: sqliteBackup } = await import("node:sqlite");
   const readDb = new DatabaseSync(dbPath, { readOnly: true });
   let current;
-  try { current = readDb.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(threadId); } finally { readDb.close(); }
+  let hasHistoryMode = false;
+  try {
+    hasHistoryMode = readDb.prepare("PRAGMA table_info(threads)").all().some((row) => row.name === "history_mode");
+    current = readDb.prepare(`SELECT rollout_path${hasHistoryMode ? ", history_mode" : ""} FROM threads WHERE id = ?`).get(threadId);
+  } finally { readDb.close(); }
   if (!current) return { skipped: true, reason: "thread-row-not-found" };
-  if (normalizePath(current.rollout_path) === normalizePath(rolloutPath)) return { ok: true, updated: false, rolloutPath };
+  const rolloutMatches = normalizePath(current.rollout_path) === normalizePath(rolloutPath);
+  const historyModeMatches = !hasHistoryMode || !desiredHistoryMode || current.history_mode === desiredHistoryMode;
+  if (rolloutMatches && historyModeMatches) return { ok: true, updated: false, rolloutPath, historyMode: desiredHistoryMode };
 
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
   const backupRoot = path.join(home.path, "backups_state", "lineage-rebase", stamp);
@@ -765,11 +773,15 @@ async function activateThreadRollout(home, threadId, rolloutPath) {
   let updated = 0;
   try {
     db.exec("PRAGMA busy_timeout = 5000");
-    updated = Number(db.prepare("UPDATE threads SET rollout_path = ? WHERE id = ? AND rollout_path <> ?").run(rolloutPath, threadId, rolloutPath).changes ?? 0);
+    if (hasHistoryMode && desiredHistoryMode) {
+      updated = Number(db.prepare("UPDATE threads SET rollout_path = ?, history_mode = ? WHERE id = ?").run(rolloutPath, desiredHistoryMode, threadId).changes ?? 0);
+    } else {
+      updated = Number(db.prepare("UPDATE threads SET rollout_path = ? WHERE id = ?").run(rolloutPath, threadId).changes ?? 0);
+    }
   } finally {
     db.close();
   }
-  return { ok: true, updated: updated > 0, rolloutPath, backupDir: backupRoot };
+  return { ok: true, updated: updated > 0, rolloutPath, historyMode: desiredHistoryMode, backupDir: backupRoot };
 }
 
 function collectRecordTurnIds(value) {
@@ -1486,7 +1498,15 @@ async function materializeStaleLineages(config, grouped) {
     const mergedSourceOrdinal = Number(descendant.meta.syncLineageBase?.merged_source_ordinal);
     if (!Number.isSafeInteger(frozenAt)) continue;
     const needsLegacyMigration = descendants.some((candidate) => Boolean(candidate.meta.syncLineageBase) && candidate.meta.historyMode !== "legacy");
-    if (!needsLegacyMigration) {
+    // Desktop clients may rewrite a materialized rollout using the SQLite
+    // history_mode and drop our lineage marker. Treat that markerless copy as
+    // another recoverable variant of the same rollout, not as a hard conflict.
+    const needsDetachedRecovery = candidates.some((candidate) =>
+      candidate.meta.rolloutId === descendant.meta.rolloutId
+      && !candidate.meta.historyBase
+      && !candidate.meta.syncLineageBase
+    );
+    if (!needsLegacyMigration && !needsDetachedRecovery) {
       if (Number.isSafeInteger(mergedSourceOrdinal)) {
         if (latestSourceOrdinal <= mergedSourceOrdinal) continue;
       } else if (latestSourceOrdinal <= frozenAt) {
@@ -1498,7 +1518,11 @@ async function materializeStaleLineages(config, grouped) {
     for (const candidate of standaloneCandidates) rankedStandalone.push({ candidate, latest: await latestOrdinal(candidate) });
     rankedStandalone.sort((a, b) => b.latest - a.latest || b.candidate.stat.mtimeMs - a.candidate.stat.mtimeMs || b.candidate.stat.size - a.candidate.stat.size);
     const standalone = rankedStandalone[0]?.candidate ?? null;
-    const additionalDescendants = descendants.filter((candidate) => candidate.filePath !== descendant.filePath && candidate.filePath !== standalone?.filePath);
+    const additionalDescendants = candidates.filter((candidate) =>
+      candidate.meta.rolloutId === descendant.meta.rolloutId
+      && candidate.filePath !== descendant.filePath
+      && candidate.filePath !== standalone?.filePath
+    );
     const targetProvider = homeProviders.get(descendant.sourceName) ?? descendant.meta.provider;
     const target = { ...descendant, meta: { ...descendant.meta, provider: targetProvider } };
     const materialized = await materializeLatestLineage(source, target, descendant.meta.rolloutId, standalone, additionalDescendants);
@@ -1507,7 +1531,8 @@ async function materializeStaleLineages(config, grouped) {
     const list = grouped.get(descendant.meta.rolloutId) ?? [];
     list.push(materialized.candidate);
     grouped.set(descendant.meta.rolloutId, list);
-    await log(`${needsLegacyMigration ? "migrated materialized lineage" : "rebased stale lineage"} ${threadId} rollout ${descendant.meta.rolloutId}: source ${frozenAt} -> ${latestSourceOrdinal}, merged ${materialized.mergedRecords} records, appended ${materialized.appendedDescendantRecords} descendant records`);
+    const reason = needsLegacyMigration ? "migrated materialized lineage" : needsDetachedRecovery ? "recovered client-rewritten lineage" : "rebased stale lineage";
+    await log(`${reason} ${threadId} rollout ${descendant.meta.rolloutId}: source ${frozenAt} -> ${latestSourceOrdinal}, merged ${materialized.mergedRecords} records, appended ${materialized.appendedDescendantRecords} descendant records`);
   }
   return materializations;
 }
@@ -1578,7 +1603,7 @@ async function selectActiveWinner(id, candidates, lockedSourceNames, stripEncryp
   return selectWinner(id, candidates, stripEncryptedContent);
 }
 
-async function mergeSessionIndex(config, deletedIds = new Set()) {
+async function mergeSessionIndex(config, deletedIds = new Set(), archivedById = new Map()) {
   if (!config.sync.includeSessionIndex) return;
   const files = [path.join(dataRepoRoot, "data", "session_index.jsonl"), ...config.homes.map((home) => path.join(home.path, "session_index.jsonl"))];
   const latest = new Map();
@@ -1602,7 +1627,13 @@ async function mergeSessionIndex(config, deletedIds = new Set()) {
   const canonical = path.join(dataRepoRoot, "data", "session_index.jsonl");
   await fsp.mkdir(path.dirname(canonical), { recursive: true });
   await fsp.writeFile(canonical, output, "utf8");
-  for (const home of config.homes) await fsp.writeFile(path.join(home.path, "session_index.jsonl"), output, "utf8");
+  const activeOutput = [...latest.values()]
+    .filter(({ entry }) => archivedById.get(entry.id) !== true)
+    .sort((a, b) => a.entry.id.localeCompare(b.entry.id))
+    .map(({ entry }) => JSON.stringify(entry))
+    .join("\n");
+  const homeOutput = activeOutput ? `${activeOutput}\n` : "";
+  for (const home of config.homes) await fsp.writeFile(path.join(home.path, "session_index.jsonl"), homeOutput, "utf8");
 }
 
 async function synchronizeFiles(config) {
@@ -1752,7 +1783,7 @@ async function synchronizeFiles(config) {
       lineageProjectionResets[threadId][home.name] = { activation, projection };
     }
   }
-  await mergeSessionIndex(config, deletion.appliedIds);
+  await mergeSessionIndex(config, deletion.appliedIds, archiveState.archivedById);
   const archiveDatabaseUpdates = {};
   let archiveDatabaseConsistent = true;
   if (!archiveState.disabled) {

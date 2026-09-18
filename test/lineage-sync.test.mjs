@@ -150,8 +150,8 @@ test("rebases a stale descendant onto the latest source without losing descendan
     await fsp.mkdir(path.dirname(childPath), { recursive: true });
     for (const [home, initialPath] of [[homeA, sourcePath], [homeB, sourcePath]]) {
       const stateDb = new DatabaseSync(path.join(home, "state_5.sqlite"));
-      stateDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER, rollout_path TEXT NOT NULL)");
-      stateDb.prepare("INSERT INTO threads (id, archived, rollout_path) VALUES (?, 0, ?)").run(threadId, initialPath);
+      stateDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER, rollout_path TEXT NOT NULL, history_mode TEXT)");
+      stateDb.prepare("INSERT INTO threads (id, archived, rollout_path, history_mode) VALUES (?, 0, ?, 'paginated')").run(threadId, initialPath);
       stateDb.close();
       const historyDb = new DatabaseSync(path.join(home, "thread_history_1.sqlite"));
       for (const table of ["thread_items", "thread_turns", "thread_realtime_items", "thread_history_projection_state"]) historyDb.exec(`CREATE TABLE ${table} (thread_id TEXT)`);
@@ -176,12 +176,29 @@ test("rebases a stale descendant onto the latest source without losing descendan
     await fsp.writeFile(childPath, childRecords.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
     const settled = new Date(Date.now() - 10 * 60_000);
     await Promise.all([sourcePath, childPath].map((entry) => fsp.utimes(entry, settled, settled)));
+    const archivedIndexId = "55555555-5555-7555-8555-555555555555";
+    const indexText = [
+      { id: threadId, thread_name: "Active lineage", updated_at: "2026-02-04T00:00:00Z" },
+      { id: archivedIndexId, thread_name: "Archived lineage", updated_at: "2026-02-04T00:00:00Z" }
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+    await fsp.writeFile(path.join(homeA, "session_index.jsonl"), indexText);
+    await fsp.writeFile(path.join(homeB, "session_index.jsonl"), indexText);
+    const archiveEventRoot = path.join(records, "data", "archive-events", archivedIndexId);
+    await fsp.mkdir(archiveEventRoot, { recursive: true });
+    await fsp.writeFile(path.join(archiveEventRoot, "event.json"), JSON.stringify({
+      schemaVersion: 1,
+      id: archivedIndexId,
+      archived: true,
+      observedAt: "2026-02-04T00:00:00Z",
+      observedAtMs: Date.parse("2026-02-04T00:00:00Z"),
+      source: "fixture"
+    }));
     await fsp.writeFile(path.join(framework, "sync.config.json"), JSON.stringify({
       schemaVersion: 1,
       homes: [{ name: "a", path: homeA }, { name: "b", path: homeB }],
       git: { dataRepository: records, remote: "origin", branch: "main", autoPull: false, autoPush: false, commitDebounceSeconds: 1 },
       providerSync: { enabled: false },
-      sync: { includeArchived: true, includeSessionIndex: false, refreshThreadIndex: false, includeUiMetadata: false, stripEncryptedContent: true, settleMilliseconds: 1, lockStaleMinutes: 30 }
+      sync: { includeArchived: true, includeSessionIndex: true, refreshThreadIndex: false, includeUiMetadata: false, stripEncryptedContent: true, settleMilliseconds: 1, lockStaleMinutes: 30 }
     }, null, 2));
 
     const result = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
@@ -196,9 +213,17 @@ test("rebases a stale descendant onto the latest source without losing descendan
     assert.match(serialized, /turn-base-new/);
     assert.match(serialized, /turn-child-only/);
     assert.equal(rebased[0].payload.sync_lineage_base.merged_source_ordinal, 4);
+    const canonicalIndex = (await fsp.readFile(path.join(records, "data", "session_index.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(canonicalIndex.map((entry) => entry.id).sort(), [archivedIndexId, threadId].sort());
+    for (const home of [homeA, homeB]) {
+      const homeIndex = (await fsp.readFile(path.join(home, "session_index.jsonl"), "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+      assert.deepEqual(homeIndex.map((entry) => entry.id), [threadId]);
+    }
     for (const home of [homeA, homeB]) {
       const db = new DatabaseSync(path.join(home, "state_5.sqlite"), { readOnly: true });
-      assert.equal(path.basename(db.prepare("SELECT rollout_path FROM threads WHERE id = ?").get(threadId).rollout_path), childName);
+      const row = db.prepare("SELECT rollout_path, history_mode FROM threads WHERE id = ?").get(threadId);
+      assert.equal(path.basename(row.rollout_path), childName);
+      assert.equal(row.history_mode, "legacy");
       db.close();
       const historyDb = new DatabaseSync(path.join(home, "thread_history_1.sqlite"), { readOnly: true });
       assert.equal(historyDb.prepare("SELECT count(*) AS count FROM thread_items WHERE thread_id = ?").get(threadId).count, 0);
@@ -221,6 +246,11 @@ test("rebases a stale descendant onto the latest source without losing descendan
       await fsp.writeFile(rolloutPath, variant.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
       await fsp.utimes(rolloutPath, settled, settled);
     }
+    for (const home of [homeA, homeB]) {
+      const db = new DatabaseSync(path.join(home, "state_5.sqlite"));
+      db.prepare("UPDATE threads SET history_mode = 'paginated' WHERE id = ?").run(threadId);
+      db.close();
+    }
     const migrationResult = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
     assert.equal(migrationResult.status, 0, `${migrationResult.stdout}\n${migrationResult.stderr}`);
     const migrated = (await fsp.readFile(childPath, "utf8")).trim().split("\n").map(JSON.parse);
@@ -228,6 +258,34 @@ test("rebases a stale descendant onto the latest source without losing descendan
     assert.match(JSON.stringify(migrated), /turn-child-only/);
     assert.match(JSON.stringify(migrated), /turn-migration-0/);
     assert.match(JSON.stringify(migrated), /turn-migration-1/);
+    for (const home of [homeA, homeB]) {
+      const db = new DatabaseSync(path.join(home, "state_5.sqlite"), { readOnly: true });
+      assert.equal(db.prepare("SELECT history_mode FROM threads WHERE id = ?").get(threadId).history_mode, "legacy");
+      db.close();
+    }
+
+    // A desktop startup can rewrite the materialized rollout as paginated and
+    // remove sync_lineage_base. Recover it without dropping a newly written
+    // client-only turn.
+    const clientRewrite = structuredClone(migrated);
+    clientRewrite[0].payload.history_mode = "paginated";
+    delete clientRewrite[0].payload.sync_lineage_base;
+    clientRewrite.push({ timestamp: "2026-02-03T00:00:09Z", ordinal: clientRewrite.length, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-client-rewrite" } });
+    await fsp.writeFile(childPath, clientRewrite.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    await fsp.utimes(childPath, settled, settled);
+    const clientDb = new DatabaseSync(path.join(homeB, "state_5.sqlite"));
+    clientDb.prepare("UPDATE threads SET history_mode = 'paginated' WHERE id = ?").run(threadId);
+    clientDb.close();
+    const recoveryResult = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
+    assert.equal(recoveryResult.status, 0, `${recoveryResult.stdout}\n${recoveryResult.stderr}`);
+    assert.ok(JSON.parse(recoveryResult.stdout).summary.rebasedLineages >= 1);
+    const recovered = (await fsp.readFile(childPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(recovered[0].payload.history_mode, "legacy");
+    assert.ok(recovered[0].payload.sync_lineage_base);
+    assert.match(JSON.stringify(recovered), /turn-client-rewrite/);
+    const recoveredDb = new DatabaseSync(path.join(homeB, "state_5.sqlite"), { readOnly: true });
+    assert.equal(recoveredDb.prepare("SELECT history_mode FROM threads WHERE id = ?").get(threadId).history_mode, "legacy");
+    recoveredDb.close();
 
     const laterSourceRecord = { timestamp: "2026-02-04T00:00:00Z", ordinal: 5, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-source-later" } };
     await fsp.appendFile(sourcePath, `${JSON.stringify(laterSourceRecord)}\n`);
