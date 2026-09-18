@@ -12,15 +12,15 @@ function createStateDb(home, projects) {
   db.exec(`
     CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, position INTEGER, created_at_ms INTEGER, updated_at_ms INTEGER);
     CREATE TABLE project_roots (project_id TEXT, position INTEGER, path TEXT);
-    CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, project_id TEXT);
+    CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, project_id TEXT, archived INTEGER NOT NULL DEFAULT 0);
   `);
   const insertProject = db.prepare("INSERT INTO projects VALUES (?, ?, ?, ?, ?)");
   const insertRoot = db.prepare("INSERT INTO project_roots VALUES (?, ?, ?)");
-  const insertThread = db.prepare("INSERT INTO threads VALUES (?, ?, ?)");
+  const insertThread = db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?)");
   projects.forEach((project, position) => {
     insertProject.run(project.appId, project.name, position, 1, 1);
     project.roots.forEach((root, rootPosition) => insertRoot.run(project.appId, rootPosition, root));
-    for (const threadId of project.threadIds ?? []) insertThread.run(threadId, null, project.appId);
+    for (const threadId of project.threadIds ?? []) insertThread.run(threadId, null, project.appId, project.archivedThreadIds?.includes(threadId) ? 1 : 0);
   });
   db.close();
 }
@@ -55,7 +55,7 @@ test("propagates a migrated Project deletion and removes stale sidebar state", a
     const records = path.join(root, "records");
     await Promise.all([official, api, path.join(records, "data")].map((entry) => fsp.mkdir(entry, { recursive: true })));
 
-    const keep = { id: "legacy-keep", appId: "app-official-keep", name: "Keep", roots: ["C:\\Work\\Keep"], threadIds: ["thread-keep"] };
+    const keep = { id: "legacy-keep", appId: "app-official-keep", name: "Keep", roots: ["C:\\Work\\Keep"], threadIds: ["thread-keep", "thread-keep-archived"], archivedThreadIds: ["thread-keep-archived"] };
     const removed = { id: "legacy-removed", appId: "app-official-removed", name: "Removed", roots: ["C:\\Work\\Removed"], threadIds: ["thread-removed"] };
     createStateDb(official, [keep]);
     createStateDb(api, [
@@ -97,6 +97,8 @@ test("propagates a migrated Project deletion and removes stale sidebar state", a
     const state = JSON.parse(await fsp.readFile(path.join(api, ".codex-global-state.json"), "utf8"));
     assert.deepEqual(Object.keys(state["local-projects"]), [keep.id]);
     assert.equal(state["thread-project-assignments"]["thread-removed"], undefined);
+    assert.equal(state["thread-project-assignments"]["thread-keep-archived"], undefined);
+    assert.equal(state["thread-project-assignments"]["thread-keep"].projectId, keep.id);
     assert.deepEqual(state["project-order"], [keep.id]);
     const hostKey = `local:${api.replaceAll("/", "\\")}`;
     assert.deepEqual(state["app-server-project-id-by-legacy-project-id-by-host"][hostKey], { [keep.id]: "app-api-keep" });

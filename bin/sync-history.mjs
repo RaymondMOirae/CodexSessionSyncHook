@@ -156,18 +156,20 @@ async function walkFiles(root, extension = null) {
   return files;
 }
 
-async function activeThreadIds(homePath) {
+async function activeThreadIds(homePath, staleMinutes = 30) {
   const lockRoot = path.join(homePath, "thread-writer-locks");
   const result = new Set();
   if (!(await exists(lockRoot))) return result;
   for (const entry of await fsp.readdir(lockRoot, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".lock") || entry.name.startsWith(".")) continue;
     const handle = await fsp.open(path.join(lockRoot, entry.name), "r+").catch(() => null);
-    if (handle) {
-      await handle.close();
+    if (!handle) {
+      result.add(entry.name.slice(0, -".lock".length));
       continue;
     }
-    result.add(entry.name.slice(0, -".lock".length));
+    await handle.close();
+    const stat = await fsp.stat(path.join(lockRoot, entry.name)).catch(() => null);
+    if (stat && Date.now() - stat.mtimeMs <= staleMinutes * 60_000) result.add(entry.name.slice(0, -".lock".length));
   }
   return result;
 }
@@ -569,6 +571,56 @@ async function copyAtomic(source, destination) {
     await fsp.rm(destination, { force: true });
     await fsp.rename(temp, destination);
   });
+}
+
+async function snapshotCompleteJsonl(source, destination) {
+  await fsp.mkdir(path.dirname(destination), { recursive: true });
+  const sourceHandle = await fsp.open(source, "r");
+  const outputHandle = await fsp.open(destination, "wx");
+  let copied = 0;
+  let lastNewline = -1;
+  try {
+    const size = (await sourceHandle.stat()).size;
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    while (copied < size) {
+      const length = Math.min(buffer.length, size - copied);
+      const { bytesRead } = await sourceHandle.read(buffer, 0, length, copied);
+      if (bytesRead === 0) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      for (let index = chunk.lastIndexOf(0x0a); index >= 0; index = chunk.lastIndexOf(0x0a, index - 1)) {
+        lastNewline = copied + index;
+        break;
+      }
+      await outputHandle.write(chunk, 0, chunk.length, copied);
+      copied += bytesRead;
+    }
+    if (lastNewline < 0) throw new Error(`active rollout has no complete JSONL record: ${source}`);
+    await outputHandle.truncate(lastNewline + 1);
+  } finally {
+    await sourceHandle.close();
+    await outputHandle.close();
+  }
+}
+
+async function snapshotActiveCandidates(candidates, rolloutId) {
+  const root = path.join(stateDir, "active-snapshots", `${process.pid}-${Date.now()}-${rolloutId}`);
+  const snapshots = [];
+  for (const candidate of candidates) {
+    if (candidate.sourceName === "git") {
+      snapshots.push(candidate);
+      continue;
+    }
+    const destination = path.join(root, candidate.sourceName.replace(/[^A-Za-z0-9._-]/g, "_"), candidate.bucket, path.basename(candidate.filePath));
+    await snapshotCompleteJsonl(candidate.filePath, destination);
+    snapshots.push({
+      ...candidate,
+      filePath: destination,
+      stat: await fsp.stat(destination),
+      snapshotOf: candidate.filePath,
+      allPaths: [destination]
+    });
+  }
+  return { root, candidates: snapshots };
 }
 
 async function copySessionForProvider(source, destination, targetProvider, stripEncryptedContent = true) {
@@ -1065,6 +1117,12 @@ async function collectLockedThreadIds(config) {
   return locked;
 }
 
+async function collectLockedThreadIdsByHome(config) {
+  const result = new Map();
+  for (const home of config.homes) result.set(home.name, await activeThreadIds(home.path));
+  return result;
+}
+
 async function selectWinner(id, candidates, stripEncryptedContent = true) {
   const enriched = [];
   for (const candidate of candidates) enriched.push({ ...candidate, digest: await canonicalDigest(candidate.filePath, stripEncryptedContent) });
@@ -1102,6 +1160,29 @@ async function selectWinner(id, candidates, stripEncryptedContent = true) {
   await fsp.writeFile(path.join(conflictRoot, id, "conflict.json"), JSON.stringify({ id, detectedAt: timestamp(), candidates: enriched.map((candidate) => ({ source: candidate.sourceName, bucket: candidate.bucket, file: candidate.filePath, size: candidate.stat.size, modifiedAt: candidate.stat.mtime.toISOString(), digest: candidate.digest })) }, null, 2));
   await log(`conflict ${id}: preserved ${enriched.length} variants`);
   return null;
+}
+
+async function selectActiveWinner(id, candidates, lockedSourceNames, stripEncryptedContent = true) {
+  const authoritative = candidates
+    .filter((candidate) => lockedSourceNames.has(candidate.sourceName))
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs || b.stat.size - a.stat.size);
+  const homeCandidates = candidates.filter((candidate) => candidate.sourceName !== "git");
+  for (const possibleWinner of authoritative) {
+    let containsAllHomes = true;
+    for (const candidate of homeCandidates) {
+      if (candidate === possibleWinner) continue;
+      if (!(await providerAgnosticPrefix(possibleWinner.filePath, candidate.filePath, stripEncryptedContent))) {
+        containsAllHomes = false;
+        break;
+      }
+    }
+    if (containsAllHomes) {
+      await fsp.rm(path.join(conflictRoot, id), { recursive: true, force: true }).catch(() => {});
+      await log(`writer-locked source ${possibleWinner.sourceName} supersedes stale canonical rollout ${id}`);
+      return possibleWinner;
+    }
+  }
+  return selectWinner(id, candidates, stripEncryptedContent);
 }
 
 async function mergeSessionIndex(config, deletedIds = new Set()) {
@@ -1147,25 +1228,39 @@ async function synchronizeFiles(config) {
     ? { archivedById: new Map(), observations: new Map(), changedIds: new Set(), needsApplyIds: new Set(), eventsWritten: 0, disabled: true }
     : await resolveArchiveStates(config, candidatesByThread);
   const active = await collectActiveThreadIds(config);
+  const lockedByHome = await collectLockedThreadIdsByHome(config);
   const homeProviders = new Map();
   for (const home of config.homes) homeProviders.set(home.name, await readConfiguredProvider(home.path));
   let copiedToCanonical = 0;
   let copiedToHomes = 0;
   let conflicts = 0;
   let archiveMoves = 0;
+  let activeSnapshotRollouts = 0;
   for (const [rolloutId, candidates] of grouped) {
     const threadIds = new Set(candidates.map((candidate) => candidate.meta.id));
     const archiveTransition = [...threadIds].some((id) => archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id));
     const activeThreadId = [...threadIds].find((id) => active.has(id));
-    if (activeThreadId && (!archiveTransition || [...threadIds].some((id) => locked.has(id)))) {
-      await log(`defer active session ${activeThreadId} rollout ${rolloutId}`);
+    if (activeThreadId && archiveTransition) {
+      await log(`defer archive transition for active session ${activeThreadId} rollout ${rolloutId}`);
       continue;
     }
-    const winner = await selectWinner(rolloutId, candidates, config.sync.stripEncryptedContent);
-    if (!winner) {
-      conflicts += 1;
-      continue;
+    let snapshot = null;
+    let effectiveCandidates = candidates;
+    if (activeThreadId) {
+      snapshot = await snapshotActiveCandidates(candidates, rolloutId);
+      effectiveCandidates = snapshot.candidates;
+      activeSnapshotRollouts += 1;
+      await log(`sync active snapshot ${activeThreadId} rollout ${rolloutId}`);
     }
+    try {
+      const lockedSourceNames = new Set(config.homes.filter((home) => activeThreadId && lockedByHome.get(home.name)?.has(activeThreadId)).map((home) => home.name));
+      const winner = activeThreadId
+        ? await selectActiveWinner(rolloutId, effectiveCandidates, lockedSourceNames, config.sync.stripEncryptedContent)
+        : await selectWinner(rolloutId, effectiveCandidates, config.sync.stripEncryptedContent);
+      if (!winner) {
+        conflicts += 1;
+        continue;
+      }
     const threadId = winner.meta.id;
     const desiredBucket = archiveState.disabled ? winner.bucket : archiveState.archivedById.get(threadId) ? "archived_sessions" : "sessions";
     const bucketRoot = canonicalRoots[desiredBucket];
@@ -1183,14 +1278,20 @@ async function synchronizeFiles(config) {
       await copyAtomic(winner.filePath, canonicalPath);
       copiedToCanonical += 1;
     }
-    for (const candidate of candidates.filter((entry) => entry.sourceName === "git" && entry.bucket === desiredBucket)) {
-      for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
-        if (path.resolve(filePath) === path.resolve(canonicalPath)) continue;
-        if (await canonicalDigest(filePath, config.sync.stripEncryptedContent) === await canonicalDigest(canonicalPath, config.sync.stripEncryptedContent)) await fsp.rm(filePath, { force: true });
+    if (!activeThreadId) {
+      for (const candidate of candidates.filter((entry) => entry.sourceName === "git" && entry.bucket === desiredBucket)) {
+        for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
+          if (path.resolve(filePath) === path.resolve(canonicalPath)) continue;
+          if (await canonicalDigest(filePath, config.sync.stripEncryptedContent) === await canonicalDigest(canonicalPath, config.sync.stripEncryptedContent)) await fsp.rm(filePath, { force: true });
+        }
       }
+      archiveMoves += await moveOppositeCopies(candidates, "git", path.join(dataRepoRoot, "data"), desiredBucket, canonicalPath);
     }
-    archiveMoves += await moveOppositeCopies(candidates, "git", path.join(dataRepoRoot, "data"), desiredBucket, canonicalPath);
     for (const home of config.homes) {
+      if (activeThreadId && lockedByHome.get(home.name)?.has(threadId)) {
+        await log(`preserve writer-locked source ${threadId} in ${home.name}`);
+        continue;
+      }
       let destination = desiredBucket === "sessions"
         ? path.join(home.path, "sessions", relative)
         : path.join(home.path, "archived_sessions", path.basename(canonicalPath));
@@ -1208,13 +1309,18 @@ async function synchronizeFiles(config) {
         await copySessionForProvider(canonicalPath, destination, targetProvider, stripForTarget);
         copiedToHomes += 1;
       }
-      for (const candidate of candidates.filter((entry) => entry.sourceName === home.name && entry.bucket === desiredBucket)) {
-        for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
-          if (path.resolve(filePath) === path.resolve(destination)) continue;
-          if (await canonicalDigest(filePath, config.sync.stripEncryptedContent) === await canonicalDigest(destination, config.sync.stripEncryptedContent)) await fsp.rm(filePath, { force: true });
+      if (!activeThreadId) {
+        for (const candidate of candidates.filter((entry) => entry.sourceName === home.name && entry.bucket === desiredBucket)) {
+          for (const filePath of candidate.allPaths ?? [candidate.filePath]) {
+            if (path.resolve(filePath) === path.resolve(destination)) continue;
+            if (await canonicalDigest(filePath, config.sync.stripEncryptedContent) === await canonicalDigest(destination, config.sync.stripEncryptedContent)) await fsp.rm(filePath, { force: true });
+          }
         }
+        archiveMoves += await moveOppositeCopies(candidates, home.name, home.path, desiredBucket, destination);
       }
-      archiveMoves += await moveOppositeCopies(candidates, home.name, home.path, desiredBucket, destination);
+    }
+    } finally {
+      if (snapshot) await fsp.rm(snapshot.root, { recursive: true, force: true }).catch(() => {});
     }
   }
   await mergeSessionIndex(config, deletion.appliedIds);
@@ -1239,6 +1345,7 @@ async function synchronizeFiles(config) {
     copiedToHomes,
     conflicts,
     archiveMoves,
+    activeSnapshotRollouts,
     archiveEventsWritten: archiveState.eventsWritten,
     deleteEventsWritten: deleteState.eventsWritten,
     deletedThreads: deletion.appliedIds.size,

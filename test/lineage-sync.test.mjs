@@ -106,6 +106,21 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
     assert.equal(summary.conflicts, 0);
     assert.equal(fs.existsSync(path.join(records, "conflicts", threadId)), false);
     assert.match(await fsp.readFile(childPathB, "utf8"), /"task_started"/);
+
+    const writerLockRoot = path.join(homeA, "thread-writer-locks");
+    await fsp.mkdir(writerLockRoot, { recursive: true });
+    await fsp.writeFile(path.join(writerLockRoot, `${threadId}.lock`), "");
+    const canonicalSource = path.join(records, "data", "sessions", "2026", "01", "01", sourceName);
+    const staleCanonicalEvent = JSON.stringify({ timestamp: "2026-01-01T00:00:01.500Z", ordinal: 2, type: "event_msg", payload: { type: "thread_settings_applied" } });
+    await fsp.writeFile(canonicalSource, `${source}${staleCanonicalEvent}\n`);
+    const liveEvent = JSON.stringify({ timestamp: new Date().toISOString(), ordinal: 4, type: "event_msg", payload: { type: "user_message", message: "live snapshot" } });
+    await fsp.appendFile(sourcePath, `${liveEvent}\n`);
+    const liveResult = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
+    assert.equal(liveResult.status, 0, `${liveResult.stdout}\n${liveResult.stderr}`);
+    assert.match(await fsp.readFile(sourcePathB, "utf8"), /live snapshot/);
+    assert.match(await fsp.readFile(canonicalSource, "utf8"), /live snapshot/);
+    assert.equal(fs.existsSync(path.join(records, "conflicts", threadId)), false);
+    assert.ok(JSON.parse(liveResult.stdout).summary.activeSnapshotRollouts >= 1);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }

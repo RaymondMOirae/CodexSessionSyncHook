@@ -415,6 +415,7 @@ export async function applyUiMetadata(config, home, metadata) {
   let nameUpdates = 0;
   let backupDir = null;
   const newlyProjectlessThreadIds = new Set();
+  const activeThreadIdsForUi = new Set();
   try {
     await client.call("initialize", {
       clientInfo: { name: "codex_history_sync", title: "Codex History Sync", version: "1.0.0" },
@@ -424,6 +425,7 @@ export async function applyUiMetadata(config, home, metadata) {
     const threads = await listAllThreads(client);
     threadCount = threads.length;
     const threadById = new Map(threads.map((thread) => [thread.id, thread]));
+    for (const thread of threads) if (!thread.__syncArchived) activeThreadIdsForUi.add(thread.id);
     const projectPage = await client.call("project/list", { limit: 100 });
     const existingProjects = projectPage.data ?? [];
     const existingByRoots = new Map(existingProjects.map((project) => [rootsKey(project.roots?.map((root) => root.path) ?? []), project]));
@@ -520,7 +522,9 @@ export async function applyUiMetadata(config, home, metadata) {
       updatedAt: project.updatedAt ?? Date.now()
     };
     if (!projectOrder.includes(project.id)) projectOrder.push(project.id);
-    for (const threadId of project.threadIds ?? []) assignments[threadId] = { projectKind: "local", projectId: project.id };
+    for (const threadId of project.threadIds ?? []) {
+      if (activeThreadIdsForUi.has(threadId)) assignments[threadId] = { projectKind: "local", projectId: project.id };
+    }
   }
   state["local-projects"] = localProjects;
   state["thread-project-assignments"] = assignments;
@@ -529,7 +533,7 @@ export async function applyUiMetadata(config, home, metadata) {
     ...projectOrder
   ].filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
   state["project-order"] = desiredOrder;
-  const projectless = new Set((state["projectless-thread-ids"] ?? []).filter((threadId) => !assignments[threadId]));
+  const projectless = new Set((state["projectless-thread-ids"] ?? []).filter((threadId) => activeThreadIdsForUi.has(threadId) && !assignments[threadId]));
   for (const threadId of newlyProjectlessThreadIds) if (!assignments[threadId]) projectless.add(threadId);
   state["projectless-thread-ids"] = [...projectless];
   const hostKey = `local:${home.path.replaceAll("/", "\\")}`;
@@ -627,6 +631,7 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
     : { ...(state["app-server-project-id-by-legacy-project-id-by-host"]?.[hostKey] ?? {}) };
   const dbPath = stateDbPath(home.path);
   const projectsByRoots = new Map();
+  let activeThreadIdsForUi = null;
 
   if (dbPath) {
     const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -639,6 +644,10 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
       }
       for (const row of db.prepare("SELECT id FROM projects").all()) {
         projectsByRoots.set(rootsKey(rootsByProject.get(row.id) ?? []), row.id);
+      }
+      const threadColumns = new Set(db.prepare("PRAGMA table_info(threads)").all().map((row) => row.name));
+      if (threadColumns.has("archived")) {
+        activeThreadIdsForUi = new Set(db.prepare("SELECT id FROM threads WHERE archived = 0").all().map((row) => row.id));
       }
     } finally {
       db.close();
@@ -654,7 +663,9 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
       updatedAt: project.updatedAt ?? Date.now()
     };
     if (!projectOrder.includes(project.id)) projectOrder.push(project.id);
-    for (const threadId of project.threadIds ?? []) assignments[threadId] = { projectKind: "local", projectId: project.id };
+    for (const threadId of project.threadIds ?? []) {
+      if (!activeThreadIdsForUi || activeThreadIdsForUi.has(threadId)) assignments[threadId] = { projectKind: "local", projectId: project.id };
+    }
     const appProjectId = projectsByRoots.get(rootsKey(project.roots ?? []));
     if (appProjectId) projectMappings[project.id] = appProjectId;
   }
@@ -665,7 +676,7 @@ export async function writeUiMetadataState(config, home, metadata, { writeBackup
     ...previousProjectOrder.filter((id) => localProjects[id]),
     ...projectOrder
   ].filter((id, index, values) => localProjects[id] && values.indexOf(id) === index);
-  state["projectless-thread-ids"] = (state["projectless-thread-ids"] ?? []).filter((threadId) => !assignments[threadId]);
+  state["projectless-thread-ids"] = (state["projectless-thread-ids"] ?? []).filter((threadId) => (!activeThreadIdsForUi || activeThreadIdsForUi.has(threadId)) && !assignments[threadId]);
   state["app-server-project-id-by-legacy-project-id-by-host"] = {
     ...(state["app-server-project-id-by-legacy-project-id-by-host"] ?? {}),
     [hostKey]: projectMappings

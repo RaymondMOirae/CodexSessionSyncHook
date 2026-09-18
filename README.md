@@ -22,7 +22,8 @@
 - 未显式配置 `model_provider` 的 Home 默认按 OpenAI Provider 处理。
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
-- 活跃或最近仍在写入的会话延迟处理。
+- 活跃会话以“截止扫描时最后一个完整 JSONL 记录”的只读快照同步到 Git 和未持锁 Home；绝不覆盖持有 writer-lock 的源文件。
+- archived task 的 Project 归属保留在 SQLite 便于 unarchive 恢复，但不会写入活动侧边栏 assignment。
 - 保留分页会话同一 thread 下的全部物理 rollout，避免续段覆盖其 `history_base` 前置段。
 - 一端历史是另一端前缀时保留较长版本。
 - 真正分叉的同一 rollout 保存到 `conflicts/<rollout-id>/`，不静默覆盖。
