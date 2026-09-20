@@ -127,6 +127,38 @@ test("preserves every physical rollout in a paginated thread lineage", async () 
   }
 });
 
+test("merges independent turns appended to the same physical rollout", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-divergent-rollout-"));
+  try {
+    const framework = path.join(root, "framework");
+    const homeA = path.join(root, "home-a");
+    const homeB = path.join(root, "home-b");
+    const records = path.join(root, "records");
+    await fsp.mkdir(framework, { recursive: true });
+    await fsp.cp(path.join(repoRoot, "bin"), path.join(framework, "bin"), { recursive: true });
+    await Promise.all([homeA, homeB, records].map((entry) => fsp.mkdir(entry, { recursive: true })));
+    await fsp.writeFile(path.join(homeA, "config.toml"), 'model_provider = "openai"\n');
+    await fsp.writeFile(path.join(homeB, "config.toml"), 'model_provider = "tencent"\n');
+    const threadId = "66666666-6666-7666-8666-666666666666";
+    const fileName = `rollout-2026-03-01T00-00-00-${threadId}.jsonl`;
+    const meta = { timestamp: "2026-03-01T00:00:00Z", ordinal: 0, type: "session_meta", payload: { id: threadId, session_id: threadId, timestamp: "2026-03-01T00:00:00Z", cwd: "C:/fixture", source: "exec", model_provider: "openai", history_mode: "paginated" } };
+    const common = [{ timestamp: "2026-03-01T00:00:01Z", ordinal: 1, type: "event_msg", payload: { type: "task_started", turn_id: "turn-common" } }, { timestamp: "2026-03-01T00:00:02Z", ordinal: 2, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-common" } }];
+    const branchA = [...common, { timestamp: "2026-03-01T00:01:00Z", ordinal: 3, type: "event_msg", payload: { type: "task_started", turn_id: "turn-astra" } }, { timestamp: "2026-03-01T00:01:01Z", ordinal: 4, type: "turn_context", payload: { turn_id: "turn-astra", model: "gpt-6-astra" } }, { timestamp: "2026-03-01T00:01:02Z", ordinal: 5, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-astra" } }];
+    const branchB = [...common, { timestamp: "2026-03-01T00:02:00Z", ordinal: 3, type: "event_msg", payload: { type: "task_started", turn_id: "turn-tcodex" } }, { timestamp: "2026-03-01T00:02:01Z", ordinal: 4, type: "event_msg", payload: { type: "task_complete", turn_id: "turn-tcodex" } }];
+    const paths = [path.join(homeA, "sessions", "2026", "03", "01", fileName), path.join(homeB, "sessions", "2026", "03", "01", fileName)];
+    for (const filePath of paths) await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    await fsp.writeFile(paths[0], [meta, ...branchA].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    const providerMeta = structuredClone(meta); providerMeta.payload.model_provider = "tencent";
+    await fsp.writeFile(paths[1], [providerMeta, ...branchB].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+    const settled = new Date(Date.now() - 10 * 60_000); await Promise.all(paths.map((entry) => fsp.utimes(entry, settled, settled)));
+    await fsp.writeFile(path.join(framework, "sync.config.json"), JSON.stringify({ schemaVersion: 1, homes: [{ name: "a", path: homeA }, { name: "b", path: homeB }], git: { dataRepository: records, remote: "origin", branch: "main", autoPull: false, autoPush: false, commitDebounceSeconds: 1 }, providerSync: { enabled: false }, sync: { includeArchived: false, includeSessionIndex: false, refreshThreadIndex: false, includeUiMetadata: false, stripEncryptedContent: true, settleMilliseconds: 1, lockStaleMinutes: 30 } }, null, 2));
+    const result = spawnSync(process.execPath, [path.join(framework, "bin", "sync-history.mjs"), "sync", "--no-pull", "--no-push", "--no-commit"], { encoding: "utf8" });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const summary = JSON.parse(result.stdout).summary; assert.equal(summary.conflicts, 0); assert.equal(summary.mergedRollouts, 1);
+    for (const filePath of [...paths, path.join(records, "data", "sessions", "2026", "03", "01", fileName)]) { const text = await fsp.readFile(filePath, "utf8"); assert.match(text, /turn-astra/); assert.match(text, /turn-tcodex/); assert.match(text, /sync_merge_state/); }
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
+
 test("rebases a stale descendant onto the latest source without losing descendant-only turns", async () => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-lineage-rebase-"));
   try {

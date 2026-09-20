@@ -23,6 +23,7 @@
 - 不同 Home 可以配置不同 Provider；同步时保留各目标 Home 的 Provider 元数据。
 - 同步会话名称、Project 定义及线程的 Project 归属。
 - 活跃会话以“截止扫描时最后一个完整 JSONL 记录”的只读快照同步到 Git 和未持锁 Home；绝不覆盖持有 writer-lock 的源文件。
+- 同一 physical rollout 在多个 Home 各自继续时，按 turn ID 合并互不冲突的完整回合，避免切换 Provider 后一侧的新消息覆盖另一侧的新消息。
 - archived task 的 Project 归属保留在 SQLite 便于 unarchive 恢复，但不会写入活动侧边栏 assignment。
 - 保留分页会话同一 thread 下的全部物理 rollout，避免续段覆盖其 `history_base` 前置段。
 - 当分页续段仍冻结在旧 `history_base`、而源 rollout 已继续增长时，自动将续段重基到最新源历史，并保留续段独有的完整回合；后续源段再次增长时继续增量合并。

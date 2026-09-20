@@ -267,7 +267,8 @@ async function readSessionMeta(filePath) {
       timestamp: typeof payload.timestamp === "string" ? payload.timestamp : null,
       ordinal: Number.isSafeInteger(parsed?.ordinal) ? parsed.ordinal : 0,
       historyBase: payload?.history_base && typeof payload.history_base === "object" ? payload.history_base : null,
-      syncLineageBase: payload?.sync_lineage_base && typeof payload.sync_lineage_base === "object" ? payload.sync_lineage_base : null
+      syncLineageBase: payload?.sync_lineage_base && typeof payload.sync_lineage_base === "object" ? payload.sync_lineage_base : null,
+      syncMergeState: payload?.sync_merge_state && typeof payload.sync_merge_state === "object" ? payload.sync_merge_state : null
     };
   } catch {
     return null;
@@ -983,6 +984,95 @@ async function materializeLatestLineage(source, descendant, rolloutId, standalon
   };
 }
 
+function setIsSubset(left, right) {
+  for (const value of left) if (!right.has(value)) return false;
+  return true;
+}
+
+function recordsByTurn(records) {
+  const result = new Map();
+  for (const record of records.slice(1)) {
+    const fingerprint = portableRecordFingerprint(record);
+    for (const turnId of collectRecordTurnIds(record)) {
+      const fingerprints = result.get(turnId) ?? new Set();
+      fingerprints.add(fingerprint);
+      result.set(turnId, fingerprints);
+    }
+  }
+  return result;
+}
+
+async function materializeDivergentRollout(rolloutId, candidates, stripEncryptedContent = true) {
+  const variants = [];
+  for (const candidate of candidates) {
+    const records = await readCompleteRolloutRecords(candidate.filePath);
+    if (records.length === 0 || records[0]?.type !== "session_meta") return null;
+    const turnRecords = recordsByTurn(records);
+    variants.push({ candidate, records, turnRecords, turnCount: turnRecords.size });
+  }
+  const fingerprintsByVariant = variants.map((variant) => crypto.createHash("sha256")
+    .update(variant.records.slice(1).map(portableRecordFingerprint).join("\n"))
+    .digest("hex"));
+  const previouslyMerged = new Set(variants.flatMap((variant) => variant.candidate.meta.syncMergeState?.merged_record_fingerprints ?? []));
+  for (const [index, variant] of variants.entries()) {
+    if (variant.candidate.meta.syncMergeState && fingerprintsByVariant.every((fingerprint) => fingerprint === fingerprintsByVariant[index] || previouslyMerged.has(fingerprint))) {
+      return variant.candidate;
+    }
+  }
+  for (let leftIndex = 0; leftIndex < variants.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < variants.length; rightIndex += 1) {
+      const left = variants[leftIndex].turnRecords;
+      const right = variants[rightIndex].turnRecords;
+      for (const turnId of left.keys()) {
+        if (!right.has(turnId)) continue;
+        const leftRecords = left.get(turnId);
+        const rightRecords = right.get(turnId);
+        if (!setIsSubset(leftRecords, rightRecords) && !setIsSubset(rightRecords, leftRecords)) return null;
+      }
+    }
+  }
+  variants.sort((a, b) => b.turnCount - a.turnCount || b.records.length - a.records.length || b.candidate.stat.mtimeMs - a.candidate.stat.mtimeMs);
+  const base = variants[0];
+  const targetProvider = base.candidate.meta.provider ?? "openai";
+  const root = path.join(stateDir, "rollout-materializations", `${process.pid}-${Date.now()}-${rolloutId}`);
+  const outputPath = path.join(root, path.basename(base.candidate.filePath));
+  await fsp.mkdir(root, { recursive: true });
+  const output = fs.createWriteStream(outputPath, { encoding: "utf8", flags: "wx" });
+  let ordinal = 0;
+  try {
+    const outputMeta = structuredClone(base.records[0]);
+    const payload = outputMeta.payload ?? outputMeta;
+    payload.model_provider = targetProvider;
+    payload.sync_merge_state = { schema_version: 1, rollout_id: rolloutId, merged_record_fingerprints: fingerprintsByVariant };
+    outputMeta.ordinal = ordinal++;
+    if (!output.write(`${JSON.stringify(outputMeta)}\n`)) await once(output, "drain");
+    const entries = [];
+    for (const [originRank, variant] of variants.entries()) {
+      for (const [index, record] of variant.records.slice(1).entries()) entries.push({ record, originRank, index, strip: stripEncryptedContent && variant.candidate.meta.provider !== targetProvider });
+    }
+    entries.sort((a, b) => recordTimestampMs(a.record) - recordTimestampMs(b.record) || a.originRank - b.originRank || a.index - b.index);
+    const seen = new Set();
+    for (const entry of entries) {
+      const fingerprint = portableRecordFingerprint(entry.record);
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+      const portable = structuredClone(entry.record);
+      portable.ordinal = ordinal++;
+      if (entry.strip) removeEncryptedContent(portable);
+      if (!output.write(`${JSON.stringify(portable)}\n`)) await once(output, "drain");
+    }
+    output.end();
+    await once(output, "finish");
+  } catch (error) {
+    output.destroy();
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+  const meta = await readSessionMeta(outputPath);
+  if (!meta) { await fsp.rm(root, { recursive: true, force: true }).catch(() => {}); return null; }
+  return { ...base.candidate, filePath: outputPath, meta, stat: await fsp.stat(outputPath), allPaths: [outputPath], sourceName: "rollout-merge-materialization", canonical: false, materializationRoot: root };
+}
+
 async function buildIndex(root, bucket) {
   const index = new Map();
   for (const filePath of await walkFiles(root, ".jsonl")) {
@@ -1525,7 +1615,7 @@ async function materializeStaleLineages(config, grouped) {
 
 async function selectWinner(id, candidates, stripEncryptedContent = true) {
   const materialized = candidates
-    .filter((candidate) => candidate.sourceName === "lineage-materialization")
+    .filter((candidate) => candidate.sourceName === "lineage-materialization" || candidate.sourceName === "rollout-merge-materialization")
     .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs || b.stat.size - a.stat.size)[0];
   if (materialized) return { ...materialized, digest: await canonicalDigest(materialized.filePath, stripEncryptedContent) };
   const enriched = [];
@@ -1554,6 +1644,13 @@ async function selectWinner(id, candidates, stripEncryptedContent = true) {
       }
     }
     if (containsAll) return possibleWinner;
+  }
+
+  const merged = await materializeDivergentRollout(id, enriched, stripEncryptedContent);
+  if (merged) {
+    await fsp.rm(path.join(conflictRoot, id), { recursive: true, force: true }).catch(() => {});
+    await log(`merged divergent rollout ${id}: preserved ${enriched.length} variants`);
+    return { ...merged, digest: await canonicalDigest(merged.filePath, stripEncryptedContent) };
   }
 
   await fsp.mkdir(path.join(conflictRoot, id), { recursive: true });
@@ -1650,12 +1747,14 @@ async function synchronizeFiles(config) {
   let archiveMoves = 0;
   let activeSnapshotRollouts = 0;
   let rebasedLineages = lineageMaterializations.length;
+  let mergedRollouts = 0;
   const lineageProjectionResets = {};
   const freshRebasedThreadIds = new Set(lineageMaterializations.map((entry) => entry.candidate.meta.id));
   const persistedLineageCandidates = [...grouped.values()].flat().filter((candidate) => candidate.meta.syncLineageBase);
   const rebasedThreadIds = new Set([...freshRebasedThreadIds, ...persistedLineageCandidates.map((candidate) => candidate.meta.id)]);
   const materializedRolloutIds = new Set([...lineageMaterializations.map((entry) => entry.candidate.meta.rolloutId), ...persistedLineageCandidates.map((candidate) => candidate.meta.rolloutId)]);
   const lineageRolloutTargets = new Map();
+  const copiedMaterializedThreadsByHome = new Map(config.homes.map((home) => [home.name, new Set()]));
   for (const [rolloutId, candidates] of grouped) {
     const threadIds = new Set(candidates.map((candidate) => candidate.meta.id));
     const archiveTransition = [...threadIds].some((id) => archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id));
@@ -1672,9 +1771,10 @@ async function synchronizeFiles(config) {
       activeSnapshotRollouts += 1;
       await log(`sync active snapshot ${activeThreadId} rollout ${rolloutId}`);
     }
+    let winner = null;
     try {
       const lockedSourceNames = new Set(config.homes.filter((home) => activeThreadId && lockedByHome.get(home.name)?.has(activeThreadId)).map((home) => home.name));
-      const winner = activeThreadId
+      winner = activeThreadId
         ? await selectActiveWinner(rolloutId, effectiveCandidates, lockedSourceNames, config.sync.stripEncryptedContent)
         : await selectWinner(rolloutId, effectiveCandidates, config.sync.stripEncryptedContent);
       if (!winner) {
@@ -1682,6 +1782,12 @@ async function synchronizeFiles(config) {
         continue;
       }
     const threadId = winner.meta.id;
+    if (winner.sourceName === "rollout-merge-materialization") {
+      mergedRollouts += 1;
+      freshRebasedThreadIds.add(threadId);
+      rebasedThreadIds.add(threadId);
+      materializedRolloutIds.add(rolloutId);
+    }
     const desiredBucket = archiveState.disabled ? winner.bucket : archiveState.archivedById.get(threadId) ? "archived_sessions" : "sessions";
     const bucketRoot = canonicalRoots[desiredBucket];
     const relative = desiredBucket === "sessions" ? chooseCanonicalRelative({ ...winner, bucket: "sessions" }) : path.basename(winner.filePath);
@@ -1732,6 +1838,7 @@ async function synchronizeFiles(config) {
       if (!(await destinationMatches(destination, expectedDestinationDigest, targetProvider, stripForTarget))) {
         await copySessionForProvider(canonicalPath, destination, targetProvider, stripForTarget);
         copiedToHomes += 1;
+        if (materializedRolloutIds.has(rolloutId)) copiedMaterializedThreadsByHome.get(home.name)?.add(threadId);
       }
       if (materializedRolloutIds.has(rolloutId)) {
         const targets = lineageRolloutTargets.get(threadId) ?? new Map();
@@ -1749,6 +1856,7 @@ async function synchronizeFiles(config) {
       }
     }
     } finally {
+      if (winner?.sourceName === "rollout-merge-materialization" && winner.materializationRoot) await fsp.rm(winner.materializationRoot, { recursive: true, force: true }).catch(() => {});
       if (snapshot) await fsp.rm(snapshot.root, { recursive: true, force: true }).catch(() => {});
     }
   }
@@ -1763,7 +1871,7 @@ async function synchronizeFiles(config) {
       const activation = rolloutPath
         ? await activateThreadRollout(home, threadId, rolloutPath)
         : { skipped: true, reason: "materialized-rollout-not-copied" };
-      const projection = activation.updated || freshRebasedThreadIds.has(threadId)
+      const projection = activation.updated || freshRebasedThreadIds.has(threadId) || copiedMaterializedThreadsByHome.get(home.name)?.has(threadId)
         ? await resetThreadHistoryProjection(home, threadId)
         : { skipped: true, reason: "rollout-already-active" };
       lineageProjectionResets[threadId][home.name] = { activation, projection };
@@ -1794,6 +1902,7 @@ async function synchronizeFiles(config) {
     archiveMoves,
     activeSnapshotRollouts,
     rebasedLineages,
+    mergedRollouts,
     lineageProjectionResets,
     archiveEventsWritten: archiveState.eventsWritten,
     deleteEventsWritten: deleteState.eventsWritten,
