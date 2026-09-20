@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { collectUiMetadata, writeUiMetadataState } from "../bin/ui-metadata.mjs";
+import { collectUiMetadata, writeUiMetadataState, writeUiMetadataObservations, reconcileProjectLayout } from "../bin/ui-metadata.mjs";
 
 function createStateDb(home, projects) {
   const db = new DatabaseSync(path.join(home, "state_5.sqlite"));
@@ -114,4 +114,44 @@ test("propagates a migrated Project deletion and removes stale sidebar state", a
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
   }
+});
+
+test("synchronizes project order, rename, moves and projectless removals instead of unioning stale assignments", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-project-layout-"));
+  try {
+    const a = path.join(root, "a"), b = path.join(root, "b"), records = path.join(root, "records");
+    await Promise.all([a, b, records].map((p) => fsp.mkdir(p)));
+    const projects = [
+      { id: "one", appId: "a-one", name: "One", roots: ["C:/one"], threadIds: ["move", "remove", "archive"], archivedThreadIds: ["archive"] },
+      { id: "two", appId: "a-two", name: "Two", roots: ["C:/two"], threadIds: [] }
+    ];
+    const bProjects = projects.map((p) => ({ ...p, appId: p.appId.replace("a-", "b-") })).reverse();
+    createStateDb(a, projects); createStateDb(b, bProjects);
+    await fsp.writeFile(path.join(a, ".codex-global-state.json"), JSON.stringify(globalState(a, projects)));
+    await fsp.writeFile(path.join(b, ".codex-global-state.json"), JSON.stringify(globalState(b, bProjects)));
+    const config = { homes: [{ name: "a", path: a }, { name: "b", path: b }], sync: { includeUiMetadata: true, propagateDeletes: true } };
+    const metadata = await collectUiMetadata(config, records);
+    assert.deepEqual(metadata.projects.map((p) => p.name), ["One", "Two"]);
+    await reconcileProjectLayout(config.homes[1], metadata);
+    await writeUiMetadataObservations(config, records, metadata);
+    const db = new DatabaseSync(path.join(b, "state_5.sqlite"));
+    db.exec("UPDATE projects SET position=1 WHERE id='b-one'; UPDATE projects SET position=0,name='Renamed' WHERE id='b-two'; UPDATE threads SET project_id='b-two' WHERE id='move'; UPDATE threads SET project_id=NULL WHERE id='remove'");
+    db.close();
+    const changed = await collectUiMetadata(config, records);
+    assert.deepEqual(changed.projects.map((p) => p.name), ["Renamed", "One"]);
+    assert.deepEqual(changed.projects[0].threadIds, ["move"]);
+    assert.deepEqual(changed.projects[1].threadIds, ["archive"]);
+    assert.deepEqual(changed.projectlessThreadIds, ["remove"]);
+    await reconcileProjectLayout(config.homes[0], changed);
+    await writeUiMetadataState(config, config.homes[0], changed);
+    const verify = new DatabaseSync(path.join(a, "state_5.sqlite"), { readOnly: true });
+    assert.equal(verify.prepare("SELECT project_id FROM threads WHERE id='remove'").get().project_id, null);
+    assert.deepEqual(verify.prepare("SELECT name FROM projects ORDER BY position").all().map((p) => p.name), ["Renamed", "One"]);
+    verify.close();
+    const state = JSON.parse(await fsp.readFile(path.join(a, ".codex-global-state.json")));
+    assert.deepEqual(state["project-order"], ["two", "one"]);
+    assert.equal(state["thread-project-assignments"].move.projectId, "two");
+    assert.equal(state["thread-project-assignments"].remove, undefined);
+    assert.equal(state["thread-project-assignments"].archive, undefined);
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
 });

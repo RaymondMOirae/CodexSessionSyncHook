@@ -9,6 +9,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { applyUiMetadata, collectUiMetadata, writeUiMetadataObservations } from "./ui-metadata.mjs";
+import { readHomeRuntime } from "./runtime-state.mjs";
+import { reconcileDesktopCatalog } from "./desktop-catalog.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -167,24 +169,8 @@ function expandConfiguredPath(value) {
 }
 
 async function homeRuntimeRunning(home) {
-  if (process.platform !== "win32") return null;
-  const configuredPaths = [
-    ...(home.runtimeProcessPaths ?? []),
-    ...(home.uiStateExitProcessPaths ?? []),
-    ...(home.clientExecutable ? [home.clientExecutable] : [])
-  ].filter(Boolean).map((value) => expandConfiguredPath(value).toLowerCase());
-  if (configuredPaths.length === 0) return null;
-  const markers = (home.runtimeCommandLineContains ?? home.uiStateExitCommandLineContains ?? []).map((value) => String(value).toLowerCase());
-  const quote = (value) => `'${value.replaceAll("'", "''")}'`;
-  const pathsLiteral = configuredPaths.map(quote).join(",");
-  const markersLiteral = markers.map(quote).join(",");
-  const script = `$paths=@(${pathsLiteral}); $markers=@(${markersLiteral}); @(Get-CimInstance Win32_Process | Where-Object { $p=$_.ExecutablePath; $c=$_.CommandLine; $pathMatch=$p -and ($paths | Where-Object { $p.ToLowerInvariant().StartsWith($_) } | Select-Object -First 1); $markerMatch=$markers.Count -eq 0 -or ($c -and ($markers | Where-Object { $c.ToLowerInvariant().Contains($_) } | Select-Object -First 1)); $pathMatch -and $markerMatch }).Count`;
-  const result = await run("powershell.exe", ["-NoProfile", "-Command", script]);
-  if (result.code !== 0) {
-    await log(`runtime process detection failed for ${home.name}: ${result.stderr.trim()}`);
-    return null;
-  }
-  return Number(result.stdout.trim()) > 0;
+  const status = await readHomeRuntime(home);
+  return status.known ? status.running : null;
 }
 
 async function collectHomeRuntimeStates(config) {
@@ -546,7 +532,7 @@ async function refreshThreadIndex(config, home) {
     const requestPage = () => send({
       method: "thread/list",
       id: ++requestId,
-      params: { limit: 100, archived, useStateDbOnly: false, ...(cursor ? { cursor } : {}) }
+      params: { limit: 100, archived, modelProviders: [], useStateDbOnly: false, ...(cursor ? { cursor } : {}) }
     });
     const timer = setTimeout(() => finish({ ok: false, reason: "timeout", pageCount, threadCount }), timeoutMs);
     child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
@@ -1884,7 +1870,15 @@ async function main() {
   if (command === "drain") {
     await new Promise((resolve) => setTimeout(resolve, Math.max(1, config.git.commitDebounceSeconds) * 1000));
   }
-  const lock = await acquireLock(config.sync.lockStaleMinutes);
+  let lock = await acquireLock(config.sync.lockStaleMinutes);
+  if (!lock && command === "start") {
+    const deadline = Date.now() + 180_000;
+    while (!lock && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      lock = await acquireLock(config.sync.lockStaleMinutes);
+    }
+    if (!lock) throw new Error("Pre-launch sync timed out waiting for the existing synchronization");
+  }
   if (!lock) {
     await log(`sync already running; command ${command} coalesced`);
     return;
@@ -1900,6 +1894,10 @@ async function main() {
     const uiMetadata = await collectUiMetadata(config, dataRepoRoot);
     summary.indexRefresh = {};
     for (const home of config.homes) {
+      if (await homeRuntimeRunning(home) === true) {
+        summary.indexRefresh[home.name] = { skipped: true, reason: "desktop-running" };
+        continue;
+      }
       const indexResult = await refreshThreadIndex(config, home);
       summary.indexRefresh[home.name] = indexResult;
       await log(`thread index refresh ${home.name}: ${JSON.stringify(indexResult)}`);
@@ -1907,7 +1905,12 @@ async function main() {
     }
     summary.uiMetadata = { projects: uiMetadata.projects.length, names: Object.keys(uiMetadata.threadNames).length, homes: {} };
     for (const home of config.homes) {
+      if (await homeRuntimeRunning(home) === true) {
+        summary.uiMetadata.homes[home.name] = { skipped: true, reason: "desktop-running" };
+        continue;
+      }
       const result = await applyUiMetadata(config, home, uiMetadata);
+      if (config.sync.includeUiMetadata !== false) result.desktopCatalog = await reconcileDesktopCatalog(home, { deletedThreadIds: config.sync.propagateDeletes ? [...(await loadDeleteEvents()).keys()] : [] });
       summary.uiMetadata.homes[home.name] = result;
       await log(`ui metadata sync ${home.name}: ${JSON.stringify(result)}`);
     }
