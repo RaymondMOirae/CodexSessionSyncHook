@@ -252,6 +252,12 @@ config.toml
 
 ## 日志与冲突
 
+Windows Hook 使用显式 PowerShell 入口，并将含路径的命令作为 UTF-16LE 编码参数传入，
+兼容外层 PowerShell 和 cmd。直接使用 `"node.exe 路径" "hook 脚本路径"` 会在
+PowerShell 中因缺少调用运算符而返回代码 1，且同步日志不会增加。
+升级后重新安装 Hook，并在客户端 Hook 设置中重新信任修改后的定义。
+若日志已经记录 `fatal`，应按具体异常排查，不要把所有代码 1 都当成命令格式错误。
+
 ```text
 .sync/sync.log
 conflicts/<rollout-id>/

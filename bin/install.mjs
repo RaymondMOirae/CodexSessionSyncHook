@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { windowsHookCommand } from "./hook-command.mjs";
 import { readToolConfig } from "./config.mjs";
 
 function run(program, args, options = {}) {
@@ -42,6 +43,8 @@ export async function installCodexHooks(repoRoot) {
   const hookEntry = path.join(repoRoot, "bin", "hook-entry.mjs");
   const nodePath = process.execPath;
   const command = `"${nodePath}" "${hookEntry}"`;
+  const startWindows = windowsHookCommand(nodePath, hookEntry, "start");
+  const endWindows = windowsHookCommand(nodePath, hookEntry, "enqueue");
   const hookConfig = {
     description: "Git-backed Codex conversation history synchronization",
     hooks: {
@@ -49,8 +52,8 @@ export async function installCodexHooks(repoRoot) {
         matcher: "startup|resume",
         hooks: [{
           type: "command",
-          command: `${command} start`,
-          commandWindows: `${command} start`,
+          command: process.platform === "win32" ? startWindows : `${command} start`,
+          commandWindows: startWindows,
           timeout: 180,
           statusMessage: "Synchronizing Codex conversation history"
         }]
@@ -58,8 +61,8 @@ export async function installCodexHooks(repoRoot) {
       SessionEnd: [{
         hooks: [{
           type: "command",
-          command: `${command} enqueue`,
-          commandWindows: `${command} enqueue`,
+          command: process.platform === "win32" ? endWindows : `${command} enqueue`,
+          commandWindows: endWindows,
           timeout: 3
         }]
       }]

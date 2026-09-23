@@ -6,7 +6,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $Node = (Get-Command node).Source
 $HookEntry = Join-Path $RepoRoot 'bin\hook-entry.mjs'
-$Config = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'sync.config.json') | ConvertFrom-Json
+$HookCommand = Join-Path $RepoRoot 'bin\hook-command.mjs'
+$StartCommand = & $Node $HookCommand $Node $HookEntry start
+if ($LASTEXITCODE -ne 0) { throw 'Failed to build SessionStart hook command' }
+$EndCommand = & $Node $HookCommand $Node $HookEntry enqueue
+if ($LASTEXITCODE -ne 0) { throw 'Failed to build SessionEnd hook command' }
+$Config = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $RepoRoot 'sync.config.json') | ConvertFrom-Json
 $Homes = @($Config.homes | Where-Object { $_.installHooks -ne $false } | ForEach-Object {
     $value = [string]$_.path
     if ($value -eq '~') { $env:USERPROFILE }
@@ -24,8 +29,8 @@ $hookObject = @{
                 hooks = @(
                     @{
                         type = 'command'
-                        commandWindows = ('"{0}" "{1}" start' -f $Node, $HookEntry)
-                        command = ('"{0}" "{1}" start' -f $Node, $HookEntry)
+                        commandWindows = $StartCommand
+                        command = $StartCommand
                         timeout = 180
                         statusMessage = 'Syncing Codex conversation history'
                     }
@@ -37,8 +42,8 @@ $hookObject = @{
                 hooks = @(
                     @{
                         type = 'command'
-                        commandWindows = ('"{0}" "{1}" enqueue' -f $Node, $HookEntry)
-                        command = ('"{0}" "{1}" enqueue' -f $Node, $HookEntry)
+                        commandWindows = $EndCommand
+                        command = $EndCommand
                         timeout = 3
                     }
                 )
