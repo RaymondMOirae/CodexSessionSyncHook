@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { expandUserPath, readToolConfig } from "./config.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const normalize = (value) => path.win32.normalize(String(value)).toLowerCase();
+const normalize = (value) => path.win32.normalize(String(value).replace(/^\\\\\?\\/, "")).toLowerCase();
 const within = (value, root) => value === root || value.startsWith(`${root.replace(/[\\/]+$/, "")}\\`);
 
 export function matchHomeProcesses(home, processes, previous = []) {
@@ -27,7 +27,7 @@ export function matchHomeProcesses(home, processes, previous = []) {
   });
   const launchers = processes.filter((p) => client && normalize(p.ExecutablePath ?? "") === client);
   return { known: true, running: backends.length + desktops.length + launchers.length > 0,
-    backendCount: backends.length, desktopCount: desktops.length,
+    backendCount: backends.length, desktopCount: desktops.length, launcherCount: launchers.length,
     processes: [...backends, ...desktops, ...launchers].map(identity), trackedDesktops: desktops.map(identity) };
 }
 

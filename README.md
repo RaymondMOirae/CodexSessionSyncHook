@@ -186,7 +186,7 @@ codex-history-sync doctor
 | `refreshThreadIndex` | `true` | 导入后调用每个 Home 的 Codex `thread/list` 补建线程索引 |
 | `indexRefreshTimeoutSeconds` | `120` | 每个 Home 的索引刷新超时 |
 | `includeUiMetadata` | `true` | 同步名称、Project 定义和线程的 Project 归属 |
-| `stripEncryptedContent` | `true` | 从跨 Home/Provider 的可移植副本中移除账号或 Provider 绑定的 `encrypted_content`，保留可见消息、工具记录和推理摘要；避免切换账号或 Provider 后继续会话时报 `invalid_encrypted_content` |
+| `stripEncryptedContent` | `true` | 跨 Provider 副本移除外来密文；原 Provider 的推理和压缩密文单独保存并恢复，避免往返同步抹掉原会话的续接状态 |
 | `settleMilliseconds` | `1500` | 扫描前等待文件写入稳定 |
 | `lockStaleMinutes` | `30` | 同步锁过期时间 |
 
@@ -251,6 +251,10 @@ config.toml
 `.githooks/pre-commit` 会阻止敏感运行时文件进入数据仓库。
 
 ## 日志与冲突
+
+原 Provider 的推理与压缩状态保存在私有记录仓库的 `data/provider-state/`，
+不会随跨 Provider 副本的脱敏而丢失。已损坏的记录可从 Git LFS 历史恢复，见
+[Provider 状态与恢复](docs/provider-state.md)。运行中的 Home 只导出快照；导入应在启动前完成。
 
 Windows Hook 使用显式 PowerShell 入口，并将含路径的命令作为 UTF-16LE 编码参数传入，
 兼容外层 PowerShell 和 cmd。直接使用 `"node.exe 路径" "hook 脚本路径"` 会在

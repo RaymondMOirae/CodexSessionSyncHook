@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { applyUiMetadata, collectUiMetadata, writeUiMetadataObservations } from "./ui-metadata.mjs";
 import { readHomeRuntime } from "./runtime-state.mjs";
 import { reconcileDesktopCatalog } from "./desktop-catalog.mjs";
+import { ProviderStateStore, isThreadWriterLocked } from "./provider-state.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -675,20 +676,42 @@ async function snapshotActiveCandidates(candidates, rolloutId) {
   return { root, candidates: snapshots };
 }
 
-async function copySessionForProvider(source, destination, targetProvider, stripEncryptedContent = true) {
+async function copySessionForProvider(source, destination, targetProvider, stripEncryptedContent = true, restoreState = null, backupRoot = null, writerLock = null) {
   await fsp.mkdir(path.dirname(destination), { recursive: true });
   const temp = `${destination}.tmp-${process.pid}-${Date.now()}`;
   const output = fs.createWriteStream(temp, { encoding: "utf8", flags: "wx" });
+  let restored = 0;
   try {
     for await (const line of await transformedLines(source, { targetProvider, stripEncryptedContent })) {
-      if (!output.write(`${line}\n`)) await once(output, "drain");
+      let restoredLine = line;
+      if (restoreState && line.trim()) {
+        const record = JSON.parse(line);
+        const count = restoreState(record);
+        restored += count;
+        if (count) restoredLine = JSON.stringify(record);
+      }
+      if (!output.write(`${restoredLine}\n`)) await once(output, "drain");
     }
     output.end();
     await once(output, "finish");
-    await fsp.rename(temp, destination).catch(async () => {
-      await fsp.rm(destination, { force: true });
-      await fsp.rename(temp, destination);
-    });
+    if (await exists(destination)) {
+      if (await canonicalDigest(temp, false) === await canonicalDigest(destination, false) && providerFromFirstLine(await readFirstLine(destination)) === targetProvider) {
+        await fsp.rm(temp); return { changed: false, restored: 0 };
+      }
+      if (backupRoot) {
+        const digest = await canonicalDigest(destination, false);
+        await fsp.mkdir(backupRoot, { recursive: true });
+        await fsp.copyFile(destination, path.join(backupRoot, `${digest}-${path.basename(destination)}`), fs.constants.COPYFILE_EXCL).catch((error) => { if (error.code !== "EEXIST") throw error; });
+      }
+    }
+    // A failed rename must never unlink a live rollout as a fallback.
+    if (writerLock && await isThreadWriterLocked(writerLock.homePath, writerLock.threadId)) {
+      await fsp.rm(temp);
+      await log(`defer destination whose writer started during sync: ${writerLock.threadId}`);
+      return { changed: false, restored: 0 };
+    }
+    await fsp.rename(temp, destination);
+    return { changed: true, restored };
   } catch (error) {
     output.destroy();
     await fsp.rm(temp, { force: true }).catch(() => {});
@@ -1046,9 +1069,17 @@ async function materializeDivergentRollout(rolloutId, candidates, stripEncrypted
     payload.sync_merge_state = { schema_version: 1, rollout_id: rolloutId, merged_record_fingerprints: fingerprintsByVariant };
     outputMeta.ordinal = ordinal++;
     if (!output.write(`${JSON.stringify(outputMeta)}\n`)) await once(output, "drain");
+
     const entries = [];
     for (const [originRank, variant] of variants.entries()) {
-      for (const [index, record] of variant.records.slice(1).entries()) entries.push({ record, originRank, index, strip: stripEncryptedContent && variant.candidate.meta.provider !== targetProvider });
+      for (const [index, record] of variant.records.slice(1).entries()) {
+        entries.push({
+          record,
+          originRank,
+          index,
+          strip: stripEncryptedContent && variant.candidate.meta.provider !== targetProvider
+        });
+      }
     }
     entries.sort((a, b) => recordTimestampMs(a.record) - recordTimestampMs(b.record) || a.originRank - b.originRank || a.index - b.index);
     const seen = new Set();
@@ -1069,8 +1100,20 @@ async function materializeDivergentRollout(rolloutId, candidates, stripEncrypted
     throw error;
   }
   const meta = await readSessionMeta(outputPath);
-  if (!meta) { await fsp.rm(root, { recursive: true, force: true }).catch(() => {}); return null; }
-  return { ...base.candidate, filePath: outputPath, meta, stat: await fsp.stat(outputPath), allPaths: [outputPath], sourceName: "rollout-merge-materialization", canonical: false, materializationRoot: root };
+  if (!meta) {
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
+  return {
+    ...base.candidate,
+    filePath: outputPath,
+    meta,
+    stat: await fsp.stat(outputPath),
+    allPaths: [outputPath],
+    sourceName: "rollout-merge-materialization",
+    canonical: false,
+    materializationRoot: root
+  };
 }
 
 async function buildIndex(root, bucket) {
@@ -1721,6 +1764,13 @@ async function mergeSessionIndex(config, deletedIds = new Set(), archivedById = 
 
 async function synchronizeFiles(config) {
   let grouped = await collectAllCandidates(config);
+  const providerStates = new ProviderStateStore(dataRepoRoot);
+  // Capture before lineage/turn merging or provider conversion can remove
+  // opaque reasoning and compaction payloads from an otherwise equal history.
+  for (const candidates of grouped.values()) for (const candidate of candidates) {
+    if (candidate.meta.provider) await providerStates.capture(candidate.meta.id, candidate.meta.provider, await readCompleteRolloutRecords(candidate.filePath));
+  }
+  await providerStates.save();
   const lineageMaterializations = await materializeStaleLineages(config, grouped);
   let candidatesByThread = groupCandidatesByThread(grouped);
   const deleteState = await resolveDeleteStates(config, candidatesByThread);
@@ -1729,6 +1779,7 @@ async function synchronizeFiles(config) {
   const deletion = deleteState.disabled
     ? { appliedIds: new Set(), deferredIds: new Set(), resultsByHome: new Map() }
     : await applyThreadDeletions(config, deleteState, candidatesByThread, locked);
+  for (const threadId of deletion.appliedIds) await providerStates.deleteThread(threadId);
   if (deletion.appliedIds.size > 0) {
     grouped = await collectAllCandidates(config);
     candidatesByThread = groupCandidatesByThread(grouped);
@@ -1738,7 +1789,6 @@ async function synchronizeFiles(config) {
     : await resolveArchiveStates(config, candidatesByThread);
   const active = await collectActiveThreadIds(config, runtimeStates);
   const lockedByHome = await collectLockedThreadIdsByHome(config, runtimeStates);
-  const rolloutPathsByHome = await readHomeRolloutPaths(config);
   const homeProviders = new Map();
   for (const home of config.homes) homeProviders.set(home.name, await readConfiguredProvider(home.path));
   let copiedToCanonical = 0;
@@ -1755,6 +1805,7 @@ async function synchronizeFiles(config) {
   const materializedRolloutIds = new Set([...lineageMaterializations.map((entry) => entry.candidate.meta.rolloutId), ...persistedLineageCandidates.map((candidate) => candidate.meta.rolloutId)]);
   const lineageRolloutTargets = new Map();
   const copiedMaterializedThreadsByHome = new Map(config.homes.map((home) => [home.name, new Set()]));
+  const restoredThreadsByHome = new Map(config.homes.map((home) => [home.name, new Set()]));
   for (const [rolloutId, candidates] of grouped) {
     const threadIds = new Set(candidates.map((candidate) => candidate.meta.id));
     const archiveTransition = [...threadIds].some((id) => archiveState.changedIds.has(id) || archiveState.needsApplyIds.has(id));
@@ -1814,6 +1865,10 @@ async function synchronizeFiles(config) {
       archiveMoves += await moveOppositeCopies(candidates, "git", path.join(dataRepoRoot, "data"), desiredBucket, canonicalPath);
     }
     for (const home of config.homes) {
+      if (runtimeStates.get(home.name) === true || lockedByHome.get(home.name)?.has(threadId)) {
+        await log(`preserve running Home or writer-locked source ${threadId} in ${home.name}`);
+        continue;
+      }
       let destination = desiredBucket === "sessions"
         ? path.join(home.path, "sessions", relative)
         : path.join(home.path, "archived_sessions", path.basename(canonicalPath));
@@ -1824,20 +1879,13 @@ async function synchronizeFiles(config) {
           destination = `${destination.slice(0, -extension.length)}-${rolloutId}${extension}`;
         }
       }
-      if (activeThreadId && lockedByHome.get(home.name)?.has(threadId)) {
-        const liveRolloutPath = rolloutPathsByHome.get(home.name)?.get(threadId);
-        if (!liveRolloutPath || normalizePath(liveRolloutPath) === normalizePath(destination)) {
-          await log(`preserve writer-locked source ${threadId} in ${home.name}`);
-          continue;
-        }
-        await log(`update inactive rollout ${rolloutId} for writer-locked thread ${threadId} in ${home.name}`);
-      }
       const targetProvider = homeProviders.get(home.name);
       const stripForTarget = config.sync.stripEncryptedContent && winner.meta.provider !== targetProvider;
-      const expectedDestinationDigest = await canonicalDigest(canonicalPath, stripForTarget);
-      if (!(await destinationMatches(destination, expectedDestinationDigest, targetProvider, stripForTarget))) {
-        await copySessionForProvider(canonicalPath, destination, targetProvider, stripForTarget);
+      const restoreState = await providerStates.restorer(threadId, targetProvider);
+      const copyResult = await copySessionForProvider(canonicalPath, destination, targetProvider, stripForTarget, restoreState, path.join(home.path, "backups_state", "provider-state"), { homePath: home.path, threadId });
+      if (copyResult.changed) {
         copiedToHomes += 1;
+        if (copyResult.restored) restoredThreadsByHome.get(home.name).add(threadId);
         if (materializedRolloutIds.has(rolloutId)) copiedMaterializedThreadsByHome.get(home.name)?.add(threadId);
       }
       if (materializedRolloutIds.has(rolloutId)) {
@@ -1856,14 +1904,20 @@ async function synchronizeFiles(config) {
       }
     }
     } finally {
-      if (winner?.sourceName === "rollout-merge-materialization" && winner.materializationRoot) await fsp.rm(winner.materializationRoot, { recursive: true, force: true }).catch(() => {});
+      if (winner?.sourceName === "rollout-merge-materialization" && winner.materializationRoot) {
+        await fsp.rm(winner.materializationRoot, { recursive: true, force: true }).catch(() => {});
+      }
       if (snapshot) await fsp.rm(snapshot.root, { recursive: true, force: true }).catch(() => {});
     }
+  }
+  for (const home of config.homes) for (const threadId of restoredThreadsByHome.get(home.name)) {
+    if (await homeRuntimeRunning(home) === true) continue;
+    await resetThreadHistoryProjection(home, threadId);
   }
   for (const threadId of rebasedThreadIds) {
     lineageProjectionResets[threadId] = {};
     for (const home of config.homes) {
-      if (lockedByHome.get(home.name)?.has(threadId)) {
+      if (runtimeStates.get(home.name) === true || lockedByHome.get(home.name)?.has(threadId)) {
         lineageProjectionResets[threadId][home.name] = { deferred: true, reason: "writer-locked" };
         continue;
       }

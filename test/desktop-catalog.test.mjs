@@ -15,6 +15,9 @@ test("tracks mirrored backend and desktop across bridge exit/backend restart wit
   const state = matchHomeProcesses(home, [desktop, backend, unrelated]);
   assert.equal(state.backendCount, 1);
   assert.equal(state.desktopCount, 1);
+  assert.equal(state.launcherCount, 0);
+  assert.equal(matchHomeProcesses(home, [{ ProcessId: 20, ExecutablePath: "C:/Apps/Bridge.exe" }]).launcherCount, 1);
+  assert.equal(matchHomeProcesses(home, [{ ...backend, ExecutablePath: "\\\\?\\C:\\fixture\\api\\runtime\\codex-mirror\\codex.exe" }]).backendCount, 1);
   assert.equal(matchHomeProcesses(home, [desktop], state.trackedDesktops).running, true);
   assert.equal(matchHomeProcesses(home, [], state.trackedDesktops).running, false);
   assert.equal(matchHomeProcesses(home, [{ ...desktop, CreationDate: "reused-pid" }], state.trackedDesktops).running, false);

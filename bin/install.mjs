@@ -104,6 +104,7 @@ export async function installRepositoryHooks(repoRoot) {
     const requiredAttributes = [
       "data/sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text",
       "data/archived_sessions/**/*.jsonl filter=lfs diff=lfs merge=lfs -text",
+      "data/provider-state/**/*.json filter=lfs diff=lfs merge=lfs -text",
       "data/session_index.jsonl text eol=lf",
       "data/archive-events/**/*.json text eol=lf",
       "data/delete-events/**/*.json text eol=lf",
